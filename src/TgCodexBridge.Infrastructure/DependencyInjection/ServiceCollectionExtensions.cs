@@ -34,7 +34,7 @@ public static class ServiceCollectionExtensions
             var stateDir = configuration["STATE_DIR"] ?? "data";
             return new SqliteStateStore(stateDir);
         });
-        services.AddSingleton<ICodexRunner, NoOpCodexRunner>();
+        services.AddSingleton<ICodexRunner, CodexCliRunner>();
         services.AddSingleton<ITopicTitleFormatter, DefaultTopicTitleFormatter>();
         services.AddSingleton<IPathPolicy, PathPolicy>();
 
