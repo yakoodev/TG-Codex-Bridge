@@ -1,5 +1,6 @@
 ﻿using System.Collections.Concurrent;
 using Microsoft.Extensions.Hosting;
+using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using Telegram.Bot;
@@ -23,7 +24,9 @@ public sealed class Worker(
     private const int MaxListElements = 300;
     private const int TelegramMessageLimit = 4000;
     private static readonly TimeSpan TitleUpdateDebounce = TimeSpan.FromSeconds(2);
-    private static readonly Regex ContextLeftRegex = new(@"(?<percent>\d{1,3})%\s+context\s+left", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ContextLeftRegex = new(@"\b(?<percent>\d{1,3})\s*%\s*context\s+left\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ApprovalCommandRegex = new(@"(?m)^\$\s*(?<cmd>.+?)\s*$", RegexOptions.Compiled);
+    private const string ApprovalPromptMarker = "Would you like to run the following command?";
     private static readonly HashSet<string> HiddenDirectoryNames = new(StringComparer.OrdinalIgnoreCase)
     {
         ".git",
@@ -36,6 +39,7 @@ public sealed class Worker(
 
     private readonly ConcurrentDictionary<long, MkprojSession> _mkprojSessions = new();
     private readonly ConcurrentDictionary<(long ChatId, int ThreadId), DateTimeOffset> _lastTitleUpdateAt = new();
+    private readonly ConcurrentDictionary<(long ChatId, int ThreadId), PendingApproval> _pendingApprovals = new();
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -237,7 +241,8 @@ public sealed class Worker(
                     await RefreshTopicTitleAsync(bot, topicToCancel with { Busy = false, Status = "cancelled" }, cancellationToken, force: true);
                 }
 
-                await bot.SendMessage(chatId, "⏹ Остановлено.", messageThreadId: threadId, cancellationToken: cancellationToken);
+                _pendingApprovals.TryRemove((chatId, threadId), out _);
+                await bot.SendMessage(chatId, "Cancelled by user.", messageThreadId: threadId, cancellationToken: cancellationToken);
                 return;
             case "/new":
                 await bot.SendMessage(chatId, "ℹ️ /new будет реализован в следующих задачах.", messageThreadId: threadId, cancellationToken: cancellationToken);
@@ -289,11 +294,16 @@ public sealed class Worker(
 
         await stateStore.StartTopicJobAsync(topic.Id, cancellationToken);
         await RefreshTopicTitleAsync(bot, topic with { Busy = true, Status = "working" }, cancellationToken, force: true);
-        await bot.SendMessage(chatId, "🛠 Codex запущен", messageThreadId: threadId, cancellationToken: cancellationToken);
+        await SendFormattedOutputAsync(bot, chatId, threadId, "status", "🛠 Codex запущен", cancellationToken);
 
         try
         {
-            var request = new CodexRunRequest(chatId, threadId, project.DirPath, prompt);
+            if (!string.IsNullOrWhiteSpace(topic.CodexChatId))
+            {
+                await SendFormattedOutputAsync(bot, chatId, threadId, "status", $"↩️ Resume: {topic.CodexChatId}", cancellationToken);
+            }
+
+            var request = new CodexRunRequest(chatId, threadId, project.DirPath, prompt, topic.CodexChatId);
             await foreach (var update in codexRunner.RunAsync(request, cancellationToken))
             {
                 var contextLeftPercent = ParseContextLeftPercent(update.Chunk);
@@ -304,22 +314,24 @@ public sealed class Worker(
                     await RefreshTopicTitleAsync(bot, topic with { Busy = true, Status = "working" }, cancellationToken);
                 }
 
+                if (TryExtractApprovalCommand(update.Chunk, out var approvalCommand))
+                {
+                    await ShowApprovalPromptAsync(bot, chatId, threadId, approvalCommand, cancellationToken);
+                    continue;
+                }
+
                 if (string.IsNullOrWhiteSpace(update.Chunk))
                 {
                     continue;
                 }
 
-                foreach (var chunk in SplitForTelegram(update.Chunk))
-                {
-                    await bot.SendMessage(chatId, chunk, messageThreadId: threadId, cancellationToken: cancellationToken);
-                }
+                await SendFormattedOutputAsync(bot, chatId, threadId, update.Kind, update.Chunk, cancellationToken);
             }
-
             await stateStore.FinishTopicJobAsync(topic.Id, "idle", cancellationToken);
             topic = topic with { Busy = false, Status = "idle" };
             await RefreshTopicTitleAsync(bot, topic, cancellationToken, force: true);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
             await stateStore.FinishTopicJobAsync(topic.Id, "cancelled", cancellationToken);
             topic = topic with { Busy = false, Status = "cancelled" };
@@ -331,7 +343,11 @@ public sealed class Worker(
             await stateStore.FinishTopicJobAsync(topic.Id, "error", cancellationToken);
             topic = topic with { Busy = false, Status = "error" };
             await RefreshTopicTitleAsync(bot, topic, cancellationToken, force: true);
-            await bot.SendMessage(chatId, $"❌ Ошибка: {ex.Message}", messageThreadId: threadId, cancellationToken: cancellationToken);
+            await SendFormattedOutputAsync(bot, chatId, threadId, "status", $"Error: {ex.Message}", cancellationToken);
+        }
+        finally
+        {
+            _pendingApprovals.TryRemove((chatId, threadId), out _);
         }
     }
 
@@ -356,7 +372,19 @@ public sealed class Worker(
 
     private async Task HandleCallbackAsync(TelegramBotClient bot, CallbackQuery callbackQuery, long groupChatId, CancellationToken cancellationToken)
     {
-        if (callbackQuery.Message?.Chat.Type != ChatType.Private || string.IsNullOrWhiteSpace(callbackQuery.Data))
+        if (string.IsNullOrWhiteSpace(callbackQuery.Data) || callbackQuery.Message is null)
+        {
+            await bot.AnswerCallbackQuery(callbackQuery.Id, cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (callbackQuery.Data.StartsWith("appr:", StringComparison.Ordinal))
+        {
+            await HandleApprovalCallbackAsync(bot, callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (callbackQuery.Message.Chat.Type != ChatType.Private)
         {
             await bot.AnswerCallbackQuery(callbackQuery.Id, cancellationToken: cancellationToken);
             return;
@@ -423,6 +451,51 @@ public sealed class Worker(
         await bot.AnswerCallbackQuery(callbackQuery.Id, cancellationToken: cancellationToken);
     }
 
+    private async Task HandleApprovalCallbackAsync(TelegramBotClient bot, CallbackQuery callbackQuery, CancellationToken cancellationToken)
+    {
+        var threadId = callbackQuery.Message?.MessageThreadId;
+        if (!threadId.HasValue)
+        {
+            await bot.AnswerCallbackQuery(callbackQuery.Id, cancellationToken: cancellationToken);
+            return;
+        }
+
+        var key = (ChatId: callbackQuery.Message!.Chat.Id, ThreadId: threadId.Value);
+        if (!_pendingApprovals.TryRemove(key, out var pending))
+        {
+            await bot.AnswerCallbackQuery(callbackQuery.Id, "Approval is not active.", cancellationToken: cancellationToken);
+            return;
+        }
+
+        var choice = callbackQuery.Data!["appr:".Length..];
+        var (input, label) = choice switch
+        {
+            "y" => ("y\n", "Yes (y)"),
+            "p" => ("p\n", "Yes always (p)"),
+            "n" => ("\u001B\n", "No (esc)"),
+            _ => ("y\n", "Yes (y)")
+        };
+
+        await codexRunner.SendInputAsync(key.ChatId, key.ThreadId, input, cancellationToken);
+
+        try
+        {
+            await bot.EditMessageText(
+                key.ChatId,
+                pending.MessageId,
+                $"{pending.PromptHtml}\n\nSelected: <b>{EscapeTelegramHtml(label)}</b>",
+                parseMode: ParseMode.Html,
+                replyMarkup: null,
+                cancellationToken: cancellationToken);
+        }
+        catch (ApiRequestException)
+        {
+            // Ignore stale approval prompt edits.
+        }
+
+        await bot.AnswerCallbackQuery(callbackQuery.Id, label, cancellationToken: cancellationToken);
+    }
+
     private async Task HandleEnteredPathAsync(TelegramBotClient bot, MkprojSession session, string rawPath, CancellationToken cancellationToken)
     {
         session.InputMode = MkprojInputMode.None;
@@ -435,7 +508,7 @@ public sealed class Worker(
 
         try
         {
-            var fullPath = Path.GetFullPath(candidatePath);
+            var fullPath = ResolveUserSuppliedPath(candidatePath);
             if (!Directory.Exists(fullPath))
             {
                 await bot.SendMessage(session.PrivateChatId, $"Папка не найдена: {fullPath}", cancellationToken: cancellationToken);
@@ -541,12 +614,19 @@ public sealed class Worker(
     private async Task RenderSessionAsync(TelegramBotClient bot, MkprojSession session, CancellationToken cancellationToken)
     {
         var view = BuildMkprojView(session);
-        await bot.EditMessageText(
-            session.PrivateChatId,
-            session.MessageId,
-            view.Text,
-            replyMarkup: view.Keyboard,
-            cancellationToken: cancellationToken);
+        try
+        {
+            await bot.EditMessageText(
+                session.PrivateChatId,
+                session.MessageId,
+                view.Text,
+                replyMarkup: view.Keyboard,
+                cancellationToken: cancellationToken);
+        }
+        catch (ApiRequestException ex) when (ex.ErrorCode == 400 && ex.Message.Contains("message is not modified", StringComparison.OrdinalIgnoreCase))
+        {
+            // User clicked a button that did not change state; nothing to update.
+        }
     }
 
     private MkprojView BuildMkprojView(MkprojSession session)
@@ -656,9 +736,9 @@ public sealed class Worker(
         session.Page = 0;
     }
 
-    private static IEnumerable<string> SplitForTelegram(string text)
+    private static IEnumerable<string> SplitForTelegram(string text, int limit = TelegramMessageLimit)
     {
-        if (text.Length <= TelegramMessageLimit)
+        if (text.Length <= limit)
         {
             yield return text;
             yield break;
@@ -667,10 +747,169 @@ public sealed class Worker(
         var start = 0;
         while (start < text.Length)
         {
-            var length = Math.Min(TelegramMessageLimit, text.Length - start);
+            var length = Math.Min(limit, text.Length - start);
             yield return text.Substring(start, length);
             start += length;
         }
+    }
+
+    private static async Task SendFormattedOutputAsync(
+        TelegramBotClient bot,
+        long chatId,
+        int threadId,
+        string kind,
+        string text,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        var payload = text.TrimEnd();
+
+        foreach (var chunk in SplitForTelegram(payload, 3200))
+        {
+            if (string.IsNullOrWhiteSpace(chunk))
+            {
+                continue;
+            }
+
+            var formatted = FormatTelegramOutput(kind, chunk);
+            await bot.SendMessage(
+                chatId,
+                formatted,
+                parseMode: ParseMode.Html,
+                messageThreadId: threadId,
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    private static string FormatTelegramOutput(string kind, string text)
+    {
+        return kind.ToLowerInvariant() switch
+        {
+            "reasoning" => $"<b>🧠 Размышление</b>\n{WrapExpandableQuote(EscapeTelegramHtml(text.TrimEnd()))}",
+            "command_start" => WrapExpandableQuote($"<b>⚙️ Команда</b>\n<code>{EscapeTelegramHtml(text.TrimEnd())}</code>"),
+            "command" => WrapExpandableQuote($"<b>⚙️ Выполнение</b>\n<pre><code>{EscapeTelegramHtml(text.TrimEnd())}</code></pre>"),
+            "status" => FormatStatusOutput(text.TrimEnd()),
+            _ => $"<b>🤖 Ответ</b>\n{RenderAnswerMarkdownAsHtml(text.TrimEnd())}"
+        };
+    }
+
+    private static string FormatStatusOutput(string text)
+    {
+        if (text.StartsWith("🛠", StringComparison.Ordinal) || text.StartsWith("✅", StringComparison.Ordinal))
+        {
+            return $"<b>{EscapeTelegramHtml(text)}</b>";
+        }
+
+        return WrapExpandableQuote(EscapeTelegramHtml(text));
+    }
+
+    private static string WrapExpandableQuote(string htmlContent)
+    {
+        return $"<blockquote expandable>{htmlContent}</blockquote>";
+    }
+
+    private static string EscapeTelegramHtml(string value)
+    {
+        return value
+            .Replace("&", "&amp;", StringComparison.Ordinal)
+            .Replace("<", "&lt;", StringComparison.Ordinal)
+            .Replace(">", "&gt;", StringComparison.Ordinal);
+    }
+
+    private static string RenderAnswerMarkdownAsHtml(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var sb = new StringBuilder();
+        var lines = value.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
+        var inCodeBlock = false;
+
+        foreach (var rawLine in lines)
+        {
+            var line = rawLine ?? string.Empty;
+
+            if (line.StartsWith("```", StringComparison.Ordinal))
+            {
+                if (!inCodeBlock)
+                {
+                    var lang = line.Length > 3 ? line[3..].Trim() : string.Empty;
+                    if (string.IsNullOrWhiteSpace(lang))
+                    {
+                        sb.Append("<pre><code>");
+                    }
+                    else
+                    {
+                        sb.Append($"<pre><code class=\"language-{EscapeTelegramHtml(lang)}\">");
+                    }
+
+                    inCodeBlock = true;
+                }
+                else
+                {
+                    sb.Append("</code></pre>\n");
+                    inCodeBlock = false;
+                }
+
+                continue;
+            }
+
+            if (inCodeBlock)
+            {
+                sb.Append(EscapeTelegramHtml(line)).Append('\n');
+                continue;
+            }
+
+            sb.Append(RenderInlineMarkdownAsHtml(line)).Append('\n');
+        }
+
+        if (inCodeBlock)
+        {
+            sb.Append("</code></pre>");
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    private static string RenderInlineMarkdownAsHtml(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return string.Empty;
+        }
+
+        if (line.StartsWith("#", StringComparison.Ordinal))
+        {
+            var heading = line.TrimStart('#', ' ');
+            return $"<b>{EscapeTelegramHtml(heading)}</b>";
+        }
+
+        var placeholders = new List<string>();
+        var source = line;
+
+        source = Regex.Replace(source, "`([^`\n]+)`", match =>
+        {
+            var token = $"\u0000{placeholders.Count}\u0000";
+            placeholders.Add($"<code>{EscapeTelegramHtml(match.Groups[1].Value)}</code>");
+            return token;
+        });
+
+        var escaped = EscapeTelegramHtml(source);
+        escaped = Regex.Replace(escaped, @"\*\*(.+?)\*\*", "<b>$1</b>");
+        escaped = Regex.Replace(escaped, @"\*(.+?)\*", "<i>$1</i>");
+
+        for (var i = 0; i < placeholders.Count; i++)
+        {
+            escaped = escaped.Replace($"\u0000{i}\u0000", placeholders[i], StringComparison.Ordinal);
+        }
+
+        return escaped;
     }
 
     private async Task RefreshTopicTitleAsync(TelegramBotClient bot, TopicRecord topic, CancellationToken cancellationToken, bool force = false)
@@ -707,6 +946,79 @@ public sealed class Worker(
         }
 
         return DateTimeOffset.UtcNow - lastUpdate >= TitleUpdateDebounce;
+    }
+
+    private async Task ShowApprovalPromptAsync(
+        TelegramBotClient bot,
+        long chatId,
+        int threadId,
+        string command,
+        CancellationToken cancellationToken)
+    {
+        var promptHtml =
+            "<b>Would you like to run the following command?</b>\n" +
+            $"<blockquote expandable><code>$ {EscapeTelegramHtml(command)}</code></blockquote>";
+
+        if (_pendingApprovals.TryGetValue((chatId, threadId), out var existing))
+        {
+            try
+            {
+                await bot.EditMessageText(
+                    chatId,
+                    existing.MessageId,
+                    promptHtml,
+                    parseMode: ParseMode.Html,
+                    replyMarkup: BuildApprovalKeyboard(),
+                    cancellationToken: cancellationToken);
+
+                _pendingApprovals[(chatId, threadId)] = existing with { PromptHtml = promptHtml };
+                return;
+            }
+            catch (ApiRequestException)
+            {
+                _pendingApprovals.TryRemove((chatId, threadId), out _);
+            }
+        }
+
+        var message = await bot.SendMessage(
+            chatId,
+            promptHtml,
+            parseMode: ParseMode.Html,
+            messageThreadId: threadId,
+            replyMarkup: BuildApprovalKeyboard(),
+            cancellationToken: cancellationToken);
+
+        _pendingApprovals[(chatId, threadId)] = new PendingApproval(message.Id, promptHtml);
+    }
+
+    private static InlineKeyboardMarkup BuildApprovalKeyboard()
+    {
+        return new InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton.WithCallbackData("Yes (y)", "appr:y"),
+                InlineKeyboardButton.WithCallbackData("Yes always (p)", "appr:p"),
+                InlineKeyboardButton.WithCallbackData("No (esc)", "appr:n")
+            ]
+        ]);
+    }
+
+    private static bool TryExtractApprovalCommand(string text, out string command)
+    {
+        command = string.Empty;
+        if (string.IsNullOrWhiteSpace(text) || !text.Contains(ApprovalPromptMarker, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var match = ApprovalCommandRegex.Match(text);
+        if (!match.Success)
+        {
+            return false;
+        }
+
+        command = match.Groups["cmd"].Value.Trim();
+        return !string.IsNullOrWhiteSpace(command);
     }
 
     private static int? ParseContextLeftPercent(string text)
@@ -754,6 +1066,41 @@ public sealed class Worker(
         return "/";
     }
 
+    private static string ResolveUserSuppliedPath(string candidatePath)
+    {
+        var trimmed = candidatePath.Trim().Trim('"');
+
+        // In Linux container mode support host-style Windows paths like C:\repo\proj.
+        if (!OperatingSystem.IsWindows() && TryMapWindowsPathToHostPath(trimmed, out var mapped))
+        {
+            return mapped;
+        }
+
+        return Path.GetFullPath(trimmed);
+    }
+
+    private static bool TryMapWindowsPathToHostPath(string input, out string mappedPath)
+    {
+        mappedPath = string.Empty;
+        if (input.Length < 3)
+        {
+            return false;
+        }
+
+        if (!char.IsAsciiLetter(input[0]) || input[1] != ':' || (input[2] != '\\' && input[2] != '/'))
+        {
+            return false;
+        }
+
+        var drive = char.ToUpperInvariant(input[0]);
+        var remainder = input[3..].Replace('\\', '/').TrimStart('/');
+        mappedPath = string.IsNullOrWhiteSpace(remainder)
+            ? $"/host/{drive}"
+            : $"/host/{drive}/{remainder}";
+
+        return true;
+    }
+
     private static string GetRequired(string name)
     {
         var value = Environment.GetEnvironmentVariable(name);
@@ -777,6 +1124,7 @@ public sealed class Worker(
         public MkprojInputMode InputMode { get; set; }
     }
 
+    private sealed record PendingApproval(int MessageId, string PromptHtml);
     private sealed record MkprojEntry(int Index, string Name, string FullPath);
     private sealed record MkprojView(string Text, InlineKeyboardMarkup Keyboard);
 
@@ -787,3 +1135,5 @@ public sealed class Worker(
         AwaitingPath
     }
 }
+
+

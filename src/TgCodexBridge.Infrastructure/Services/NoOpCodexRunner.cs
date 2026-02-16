@@ -17,4 +17,9 @@ public sealed class NoOpCodexRunner : ICodexRunner
     {
         return Task.CompletedTask;
     }
+
+    public Task SendInputAsync(long chatId, int messageThreadId, string input, CancellationToken cancellationToken = default)
+    {
+        return Task.CompletedTask;
+    }
 }
