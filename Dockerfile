@@ -25,6 +25,6 @@ VOLUME ["/data"]
 
 COPY --from=build /app/publish .
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["/bin/sh", "-c", "test -f /data/heartbeat"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["/bin/sh", "-c", "test -f /data/heartbeat && test -f /data/state.db && test -d /data/logs"]
 
 ENTRYPOINT ["dotnet", "TgCodexBridge.Bot.dll"]

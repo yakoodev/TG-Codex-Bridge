@@ -20,3 +20,8 @@ dotnet run --project src/TgCodexBridge.Bot
 cp .env.example .env
 docker compose up -d --build
 ```
+
+После старта в `./data` должны появиться:
+- `state.db`
+- `heartbeat`
+- `logs/app.log`
