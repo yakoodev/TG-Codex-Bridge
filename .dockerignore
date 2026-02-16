@@ -1,0 +1,9 @@
+﻿bin/
+obj/
+.git/
+.vs/
+.vscode/
+.idea/
+**/*.user
+**/*.suo
+data/

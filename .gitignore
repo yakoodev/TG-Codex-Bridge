@@ -1,0 +1,32 @@
+﻿# Build artifacts
+bin/
+obj/
+
+# User/IDE
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dotnet local home for sandbox
+.dotnet_home/
+.dotnet/
+
+# Runtime data
+/data/
+
+# Logs
+*.log
+
+# Local env
+.env
+
+# dotnet template cache
+.templateengine/

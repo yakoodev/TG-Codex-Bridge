@@ -1,0 +1,19 @@
+﻿services:
+  tg-codex-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      ALLOWED_USER_ID: ${ALLOWED_USER_ID}
+      GROUP_CHAT_ID: ${GROUP_CHAT_ID}
+      STATE_DIR: /data
+      LOG_DIR: /data/logs
+      CODEX_BIN: codex
+      PATH_POLICY_MODE: all
+      ALLOWED_ROOTS: ${ALLOWED_ROOTS:-}
+      CANCEL_SOFT_TIMEOUT_SEC: 10
+      CANCEL_KILL_TIMEOUT_SEC: 5
+    volumes:
+      - ./data:/data
