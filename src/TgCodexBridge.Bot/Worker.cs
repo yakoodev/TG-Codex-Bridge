@@ -1,24 +1,23 @@
 ﻿using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using TgCodexBridge.Core.Abstractions;
 
 namespace TgCodexBridge.Bot;
 
-public sealed class Worker(ILogger<Worker> logger) : BackgroundService
+public sealed class Worker(ILogger<Worker> logger, IStateStore stateStore) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var stateDir = Environment.GetEnvironmentVariable("STATE_DIR") ?? "data";
         var logDir = Environment.GetEnvironmentVariable("LOG_DIR") ?? Path.Combine(stateDir, "logs");
-        var stateDbPath = Path.Combine(stateDir, "state.db");
         var heartbeatPath = Path.Combine(stateDir, "heartbeat");
         var appLogPath = Path.Combine(logDir, "app.log");
 
         Directory.CreateDirectory(stateDir);
         Directory.CreateDirectory(logDir);
-        if (!File.Exists(stateDbPath))
-        {
-            await File.WriteAllTextAsync(stateDbPath, "-- sqlite bootstrap placeholder\n", stoppingToken);
-        }
+
+        // Force SQLite init + migrations on startup.
+        _ = await stateStore.GetOrCreateProjectAsync(Environment.CurrentDirectory, stoppingToken);
 
         logger.LogInformation("Started");
         await File.AppendAllTextAsync(appLogPath, $"{DateTimeOffset.UtcNow:O} Started{Environment.NewLine}", stoppingToken);

@@ -6,30 +6,102 @@ namespace TgCodexBridge.Infrastructure.Services;
 
 public sealed class InMemoryStateStore : IStateStore
 {
-    private readonly ConcurrentDictionary<(long ChatId, int ThreadId), TopicBinding> _bindings = new();
-    private readonly ConcurrentDictionary<(long ChatId, int ThreadId), TopicStatus> _statuses = new();
+    private readonly ConcurrentDictionary<string, ProjectRecord> _projectsByPath = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<long, TopicRecord> _topicsById = new();
+    private readonly ConcurrentDictionary<(long ChatId, int ThreadId), long> _topicIdByThread = new();
+    private long _projectId;
+    private long _topicId;
 
-    public Task SaveTopicBindingAsync(TopicBinding binding, CancellationToken cancellationToken = default)
+    public Task<ProjectRecord> GetOrCreateProjectAsync(string dirPath, CancellationToken cancellationToken = default)
     {
-        _bindings[(binding.ChatId, binding.MessageThreadId)] = binding;
+        var normalizedPath = Path.GetFullPath(dirPath);
+        var project = _projectsByPath.GetOrAdd(normalizedPath, path => new ProjectRecord(Interlocked.Increment(ref _projectId), path, DateTimeOffset.UtcNow));
+        return Task.FromResult(project);
+    }
+
+    public Task<TopicRecord> CreateTopicAsync(long projectId, long groupChatId, int threadId, string name, CancellationToken cancellationToken = default)
+    {
+        if (_topicIdByThread.TryGetValue((groupChatId, threadId), out var existingTopicId) && _topicsById.TryGetValue(existingTopicId, out var existingTopic))
+        {
+            return Task.FromResult(existingTopic);
+        }
+
+        var topic = new TopicRecord(
+            Id: Interlocked.Increment(ref _topicId),
+            ProjectId: projectId,
+            GroupChatId: groupChatId,
+            MessageThreadId: threadId,
+            CodexChatId: null,
+            Name: name,
+            Busy: false,
+            Status: "idle",
+            ContextLeftPercent: null,
+            LastJobStartedAt: null,
+            LastJobFinishedAt: null);
+
+        _topicsById[topic.Id] = topic;
+        _topicIdByThread[(groupChatId, threadId)] = topic.Id;
+        return Task.FromResult(topic);
+    }
+
+    public Task<TopicRecord?> GetTopicByThreadIdAsync(long groupChatId, int threadId, CancellationToken cancellationToken = default)
+    {
+        if (_topicIdByThread.TryGetValue((groupChatId, threadId), out var topicId) && _topicsById.TryGetValue(topicId, out var topic))
+        {
+            return Task.FromResult<TopicRecord?>(topic);
+        }
+
+        return Task.FromResult<TopicRecord?>(null);
+    }
+
+    public Task SetTopicBusyAsync(long topicId, bool busy, CancellationToken cancellationToken = default)
+    {
+        Update(topicId, t => t with { Busy = busy });
         return Task.CompletedTask;
     }
 
-    public Task<TopicBinding?> GetTopicBindingAsync(long chatId, int messageThreadId, CancellationToken cancellationToken = default)
+    public Task UpdateTopicStatusAsync(long topicId, string status, CancellationToken cancellationToken = default)
     {
-        _bindings.TryGetValue((chatId, messageThreadId), out var binding);
-        return Task.FromResult(binding);
-    }
-
-    public Task SaveTopicStatusAsync(long chatId, int messageThreadId, TopicStatus status, CancellationToken cancellationToken = default)
-    {
-        _statuses[(chatId, messageThreadId)] = status;
+        Update(topicId, t => t with { Status = status });
         return Task.CompletedTask;
     }
 
-    public Task<TopicStatus?> GetTopicStatusAsync(long chatId, int messageThreadId, CancellationToken cancellationToken = default)
+    public Task UpdateTopicContextLeftAsync(long topicId, int? percent, CancellationToken cancellationToken = default)
     {
-        _statuses.TryGetValue((chatId, messageThreadId), out var status);
-        return Task.FromResult(status);
+        Update(topicId, t => t with { ContextLeftPercent = percent });
+        return Task.CompletedTask;
+    }
+
+    public Task UpdateTopicCodexChatIdAsync(long topicId, string? codexChatId, CancellationToken cancellationToken = default)
+    {
+        Update(topicId, t => t with { CodexChatId = codexChatId });
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyList<long>> ListNotifyUsersAsync(CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult<IReadOnlyList<long>>([]);
+    }
+
+    public Task StartTopicJobAsync(long topicId, CancellationToken cancellationToken = default)
+    {
+        var now = DateTimeOffset.UtcNow;
+        Update(topicId, t => t with { Busy = true, Status = "working", LastJobStartedAt = now, LastJobFinishedAt = null });
+        return Task.CompletedTask;
+    }
+
+    public Task FinishTopicJobAsync(long topicId, string finalStatus, CancellationToken cancellationToken = default)
+    {
+        var now = DateTimeOffset.UtcNow;
+        Update(topicId, t => t with { Busy = false, Status = finalStatus, LastJobFinishedAt = now });
+        return Task.CompletedTask;
+    }
+
+    private void Update(long topicId, Func<TopicRecord, TopicRecord> updater)
+    {
+        if (_topicsById.TryGetValue(topicId, out var topic))
+        {
+            _topicsById[topicId] = updater(topic);
+        }
     }
 }

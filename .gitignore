@@ -18,6 +18,7 @@ Thumbs.db
 # Dotnet local home for sandbox
 .dotnet_home/
 .dotnet/
+.nuget/
 
 # Runtime data
 /data/
