@@ -1,14 +1,47 @@
-﻿using TgCodexBridge.Core.Abstractions;
+using TgCodexBridge.Core.Abstractions;
 
 namespace TgCodexBridge.Infrastructure.Services;
 
 public sealed class DefaultTopicTitleFormatter : ITopicTitleFormatter
 {
-    public string Format(string projectName, bool isBusy, int? contextLeftPercent = null, string? status = null)
+    private const int MaxTitleLength = 119;
+
+    public string Format(string projectName, string directoryPath, bool isBusy, int? contextLeftPercent = null, string? status = null)
     {
-        var state = isBusy ? "busy" : "idle";
-        var context = contextLeftPercent.HasValue ? $" ({contextLeftPercent.Value}% ctx)" : string.Empty;
-        var suffix = string.IsNullOrWhiteSpace(status) ? string.Empty : $" - {status}";
-        return $"{projectName} [{state}{context}]{suffix}";
+        var emoji = ResolveEmoji(isBusy, status);
+        var normalizedContext = contextLeftPercent.HasValue
+            ? Math.Clamp(contextLeftPercent.Value, 0, 100).ToString()
+            : "??";
+
+        var title = $"{emoji} {projectName} · {normalizedContext}% · {GetTail(directoryPath)}";
+        return title.Length < 120 ? title : title[..MaxTitleLength];
+    }
+
+    private static string ResolveEmoji(bool isBusy, string? status)
+    {
+        if (isBusy)
+        {
+            return "🟡";
+        }
+
+        if (status is "error" or "cancelled")
+        {
+            return "🔴";
+        }
+
+        return "🟢";
+    }
+
+    private static string GetTail(string path)
+    {
+        var parts = path
+            .Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries);
+
+        if (parts.Length == 0)
+        {
+            return path;
+        }
+
+        return parts.Length == 1 ? parts[0] : $"{parts[^2]}/{parts[^1]}";
     }
 }

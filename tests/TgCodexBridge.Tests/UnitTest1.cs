@@ -6,6 +6,30 @@ namespace TgCodexBridge.Tests;
 public sealed class StateStoreTests
 {
     [Fact]
+    public void TopicTitleFormatter_ProducesExpectedShape()
+    {
+        var formatter = new DefaultTopicTitleFormatter();
+
+        var idle = formatter.Format("proj", "C:/work/repos/proj", isBusy: false, contextLeftPercent: 77, status: "idle");
+        var working = formatter.Format("proj", "C:/work/repos/proj", isBusy: true, contextLeftPercent: 55, status: "working");
+        var cancelled = formatter.Format("proj", "C:/work/repos/proj", isBusy: false, contextLeftPercent: 11, status: "cancelled");
+
+        Assert.Equal("🟢 proj · 77% · repos/proj", idle);
+        Assert.Equal("🟡 proj · 55% · repos/proj", working);
+        Assert.Equal("🔴 proj · 11% · repos/proj", cancelled);
+    }
+
+    [Fact]
+    public void TopicTitleFormatter_TruncatesToTelegramSafeLength()
+    {
+        var formatter = new DefaultTopicTitleFormatter();
+
+        var title = formatter.Format(new string('a', 200), "C:/very/long/path/for/testing", isBusy: false, contextLeftPercent: null, status: "idle");
+
+        Assert.True(title.Length < 120);
+    }
+
+    [Fact]
     public async Task SqliteSchemaIsCreatedAndCanBeReused()
     {
         var stateDir = CreateTempDir();

@@ -2,5 +2,5 @@
 
 public interface ITopicTitleFormatter
 {
-    string Format(string projectName, bool isBusy, int? contextLeftPercent = null, string? status = null);
+    string Format(string projectName, string directoryPath, bool isBusy, int? contextLeftPercent = null, string? status = null);
 }

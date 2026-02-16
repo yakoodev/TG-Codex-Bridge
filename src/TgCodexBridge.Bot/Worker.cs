@@ -1,5 +1,6 @@
 ﻿using System.Collections.Concurrent;
 using Microsoft.Extensions.Hosting;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
@@ -15,11 +16,14 @@ public sealed class Worker(
     ILogger<Worker> logger,
     IStateStore stateStore,
     ICodexRunner codexRunner,
-    IPathPolicy pathPolicy) : BackgroundService
+    IPathPolicy pathPolicy,
+    ITopicTitleFormatter topicTitleFormatter) : BackgroundService
 {
     private const int PageSize = 30;
     private const int MaxListElements = 300;
     private const int TelegramMessageLimit = 4000;
+    private static readonly TimeSpan TitleUpdateDebounce = TimeSpan.FromSeconds(2);
+    private static readonly Regex ContextLeftRegex = new(@"(?<percent>\d{1,3})%\s+context\s+left", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly HashSet<string> HiddenDirectoryNames = new(StringComparer.OrdinalIgnoreCase)
     {
         ".git",
@@ -31,6 +35,7 @@ public sealed class Worker(
     };
 
     private readonly ConcurrentDictionary<long, MkprojSession> _mkprojSessions = new();
+    private readonly ConcurrentDictionary<(long ChatId, int ThreadId), DateTimeOffset> _lastTitleUpdateAt = new();
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -229,6 +234,7 @@ public sealed class Worker(
                 if (topicToCancel is not null)
                 {
                     await stateStore.FinishTopicJobAsync(topicToCancel.Id, "cancelled", cancellationToken);
+                    await RefreshTopicTitleAsync(bot, topicToCancel with { Busy = false, Status = "cancelled" }, cancellationToken, force: true);
                 }
 
                 await bot.SendMessage(chatId, "⏹ Остановлено.", messageThreadId: threadId, cancellationToken: cancellationToken);
@@ -282,6 +288,7 @@ public sealed class Worker(
         }
 
         await stateStore.StartTopicJobAsync(topic.Id, cancellationToken);
+        await RefreshTopicTitleAsync(bot, topic with { Busy = true, Status = "working" }, cancellationToken, force: true);
         await bot.SendMessage(chatId, "🛠 Codex запущен", messageThreadId: threadId, cancellationToken: cancellationToken);
 
         try
@@ -289,6 +296,14 @@ public sealed class Worker(
             var request = new CodexRunRequest(chatId, threadId, project.DirPath, prompt);
             await foreach (var update in codexRunner.RunAsync(request, cancellationToken))
             {
+                var contextLeftPercent = ParseContextLeftPercent(update.Chunk);
+                if (contextLeftPercent.HasValue && contextLeftPercent != topic.ContextLeftPercent)
+                {
+                    topic = topic with { ContextLeftPercent = contextLeftPercent };
+                    await stateStore.UpdateTopicContextLeftAsync(topic.Id, contextLeftPercent, cancellationToken);
+                    await RefreshTopicTitleAsync(bot, topic with { Busy = true, Status = "working" }, cancellationToken);
+                }
+
                 if (string.IsNullOrWhiteSpace(update.Chunk))
                 {
                     continue;
@@ -301,15 +316,21 @@ public sealed class Worker(
             }
 
             await stateStore.FinishTopicJobAsync(topic.Id, "idle", cancellationToken);
+            topic = topic with { Busy = false, Status = "idle" };
+            await RefreshTopicTitleAsync(bot, topic, cancellationToken, force: true);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             await stateStore.FinishTopicJobAsync(topic.Id, "cancelled", cancellationToken);
+            topic = topic with { Busy = false, Status = "cancelled" };
+            await RefreshTopicTitleAsync(bot, topic, cancellationToken, force: true);
         }
         catch (Exception ex)
         {
             logger.LogError(ex, "Topic job failed; chatId={ChatId}, threadId={ThreadId}", chatId, threadId);
             await stateStore.FinishTopicJobAsync(topic.Id, "error", cancellationToken);
+            topic = topic with { Busy = false, Status = "error" };
+            await RefreshTopicTitleAsync(bot, topic, cancellationToken, force: true);
             await bot.SendMessage(chatId, $"❌ Ошибка: {ex.Message}", messageThreadId: threadId, cancellationToken: cancellationToken);
         }
     }
@@ -496,7 +517,7 @@ public sealed class Worker(
             projectName = selectedDirectory;
         }
 
-        var title = BuildInitialTopicTitle(projectName, selectedDirectory);
+        var title = topicTitleFormatter.Format(projectName, selectedDirectory, isBusy: false, contextLeftPercent: null, status: "idle");
         var forumTopic = await bot.CreateForumTopic(groupChatId, title, cancellationToken: cancellationToken);
 
         var topic = await stateStore.CreateTopicAsync(
@@ -652,22 +673,56 @@ public sealed class Worker(
         }
     }
 
-    private static string BuildInitialTopicTitle(string projectName, string directory)
+    private async Task RefreshTopicTitleAsync(TelegramBotClient bot, TopicRecord topic, CancellationToken cancellationToken, bool force = false)
     {
-        return $"🟢 {projectName} · ??% · {GetTail(directory)}";
-    }
-
-    private static string GetTail(string path)
-    {
-        var parts = path
-            .Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries);
-
-        if (parts.Length == 0)
+        if (!force && !CanUpdateTopicTitleNow(topic.GroupChatId, topic.MessageThreadId))
         {
-            return path;
+            return;
         }
 
-        return parts.Length == 1 ? parts[0] : $"{parts[^2]}/{parts[^1]}";
+        var project = await stateStore.GetProjectByIdAsync(topic.ProjectId, cancellationToken);
+        if (project is null)
+        {
+            return;
+        }
+
+        var title = topicTitleFormatter.Format(topic.Name, project.DirPath, topic.Busy, topic.ContextLeftPercent, topic.Status);
+        try
+        {
+            await bot.EditForumTopic(topic.GroupChatId, topic.MessageThreadId, title, cancellationToken: cancellationToken);
+            _lastTitleUpdateAt[(topic.GroupChatId, topic.MessageThreadId)] = DateTimeOffset.UtcNow;
+        }
+        catch (ApiRequestException ex)
+        {
+            logger.LogWarning(ex, "Failed to update topic title; chatId={ChatId}, threadId={ThreadId}", topic.GroupChatId, topic.MessageThreadId);
+        }
+    }
+
+    private bool CanUpdateTopicTitleNow(long chatId, int threadId)
+    {
+        var key = (chatId, threadId);
+        if (!_lastTitleUpdateAt.TryGetValue(key, out var lastUpdate))
+        {
+            return true;
+        }
+
+        return DateTimeOffset.UtcNow - lastUpdate >= TitleUpdateDebounce;
+    }
+
+    private static int? ParseContextLeftPercent(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return null;
+        }
+
+        var match = ContextLeftRegex.Match(text);
+        if (!match.Success || !int.TryParse(match.Groups["percent"].Value, out var percent))
+        {
+            return null;
+        }
+
+        return Math.Clamp(percent, 0, 100);
     }
 
     private static string? ParseCommand(string text)
