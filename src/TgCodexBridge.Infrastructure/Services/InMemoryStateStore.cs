@@ -7,6 +7,7 @@ namespace TgCodexBridge.Infrastructure.Services;
 public sealed class InMemoryStateStore : IStateStore
 {
     private readonly ConcurrentDictionary<string, ProjectRecord> _projectsByPath = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<long, ProjectRecord> _projectsById = new();
     private readonly ConcurrentDictionary<long, TopicRecord> _topicsById = new();
     private readonly ConcurrentDictionary<(long ChatId, int ThreadId), long> _topicIdByThread = new();
     private long _projectId;
@@ -15,8 +16,21 @@ public sealed class InMemoryStateStore : IStateStore
     public Task<ProjectRecord> GetOrCreateProjectAsync(string dirPath, CancellationToken cancellationToken = default)
     {
         var normalizedPath = Path.GetFullPath(dirPath);
-        var project = _projectsByPath.GetOrAdd(normalizedPath, path => new ProjectRecord(Interlocked.Increment(ref _projectId), path, DateTimeOffset.UtcNow));
+        var project = _projectsByPath.GetOrAdd(normalizedPath, path =>
+        {
+            var created = new ProjectRecord(Interlocked.Increment(ref _projectId), path, DateTimeOffset.UtcNow);
+            _projectsById[created.Id] = created;
+            return created;
+        });
+
+        _projectsById[project.Id] = project;
         return Task.FromResult(project);
+    }
+
+    public Task<ProjectRecord?> GetProjectByIdAsync(long projectId, CancellationToken cancellationToken = default)
+    {
+        _projectsById.TryGetValue(projectId, out var project);
+        return Task.FromResult<ProjectRecord?>(project);
     }
 
     public Task<TopicRecord> CreateTopicAsync(long projectId, long groupChatId, int threadId, string name, CancellationToken cancellationToken = default)

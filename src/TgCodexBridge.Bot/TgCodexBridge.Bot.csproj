@@ -12,6 +12,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Telegram.Bot" Version="22.7.0" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\TgCodexBridge.Core\TgCodexBridge.Core.csproj" />
     <ProjectReference Include="..\TgCodexBridge.Infrastructure\TgCodexBridge.Infrastructure.csproj" />
   </ItemGroup>

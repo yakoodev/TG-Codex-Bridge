@@ -65,6 +65,31 @@ public sealed class SqliteStateStore : IStateStore
             CreatedAt: DateTimeOffset.Parse(reader.GetString(2)));
     }
 
+    public async Task<ProjectRecord?> GetProjectByIdAsync(long projectId, CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT id, dir_path, created_at
+            FROM projects
+            WHERE id = $projectId;
+            """;
+        command.Parameters.AddWithValue("$projectId", projectId);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return new ProjectRecord(
+            Id: reader.GetInt64(0),
+            DirPath: reader.GetString(1),
+            CreatedAt: DateTimeOffset.Parse(reader.GetString(2)));
+    }
+
     public async Task<TopicRecord> CreateTopicAsync(long projectId, long groupChatId, int threadId, string name, CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync(cancellationToken);

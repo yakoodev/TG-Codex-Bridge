@@ -5,6 +5,7 @@ namespace TgCodexBridge.Core.Abstractions;
 public interface IStateStore
 {
     Task<ProjectRecord> GetOrCreateProjectAsync(string dirPath, CancellationToken cancellationToken = default);
+    Task<ProjectRecord?> GetProjectByIdAsync(long projectId, CancellationToken cancellationToken = default);
     Task<TopicRecord> CreateTopicAsync(long projectId, long groupChatId, int threadId, string name, CancellationToken cancellationToken = default);
     Task<TopicRecord?> GetTopicByThreadIdAsync(long groupChatId, int threadId, CancellationToken cancellationToken = default);
     Task SetTopicBusyAsync(long topicId, bool busy, CancellationToken cancellationToken = default);

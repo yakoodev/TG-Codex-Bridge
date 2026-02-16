@@ -54,6 +54,10 @@ public sealed class StateStoreTests
             var store = new SqliteStateStore(stateDir);
 
             var project = await store.GetOrCreateProjectAsync("C:/repo/proj-b");
+            var loadedProject = await store.GetProjectByIdAsync(project.Id);
+            Assert.NotNull(loadedProject);
+            Assert.Equal(project.DirPath, loadedProject!.DirPath);
+
             var topic = await store.CreateTopicAsync(project.Id, groupChatId: -100123456, threadId: 42, name: "proj-b");
 
             var loaded = await store.GetTopicByThreadIdAsync(-100123456, 42);

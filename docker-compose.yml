@@ -17,3 +17,4 @@
       CANCEL_KILL_TIMEOUT_SEC: 5
     volumes:
       - ./data:/data
+      - C:/:/host/C

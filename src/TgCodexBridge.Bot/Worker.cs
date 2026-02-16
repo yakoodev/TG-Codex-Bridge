@@ -1,11 +1,37 @@
-﻿using Microsoft.Extensions.Hosting;
+﻿using System.Collections.Concurrent;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Telegram.Bot;
+using Telegram.Bot.Exceptions;
+using Telegram.Bot.Types;
+using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Types.ReplyMarkups;
 using TgCodexBridge.Core.Abstractions;
+using TgCodexBridge.Core.Models;
 
 namespace TgCodexBridge.Bot;
 
-public sealed class Worker(ILogger<Worker> logger, IStateStore stateStore) : BackgroundService
+public sealed class Worker(
+    ILogger<Worker> logger,
+    IStateStore stateStore,
+    ICodexRunner codexRunner,
+    IPathPolicy pathPolicy) : BackgroundService
 {
+    private const int PageSize = 30;
+    private const int MaxListElements = 300;
+    private const int TelegramMessageLimit = 4000;
+    private static readonly HashSet<string> HiddenDirectoryNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".git",
+        "node_modules",
+        "bin",
+        "obj",
+        "Library",
+        "Temp"
+    };
+
+    private readonly ConcurrentDictionary<long, MkprojSession> _mkprojSessions = new();
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var stateDir = Environment.GetEnvironmentVariable("STATE_DIR") ?? "data";
@@ -16,18 +42,693 @@ public sealed class Worker(ILogger<Worker> logger, IStateStore stateStore) : Bac
         Directory.CreateDirectory(stateDir);
         Directory.CreateDirectory(logDir);
 
-        // Force SQLite init + migrations on startup.
         _ = await stateStore.GetOrCreateProjectAsync(Environment.CurrentDirectory, stoppingToken);
 
-        logger.LogInformation("Started");
+        var botToken = GetRequired("BOT_TOKEN");
+        var allowedUserId = long.Parse(GetRequired("ALLOWED_USER_ID"));
+        var groupChatId = long.Parse(GetRequired("GROUP_CHAT_ID"));
+
+        var bot = new TelegramBotClient(botToken);
+        var offset = 0;
+
+        logger.LogInformation("Started telegram polling");
         await File.AppendAllTextAsync(appLogPath, $"{DateTimeOffset.UtcNow:O} Started{Environment.NewLine}", stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            logger.LogInformation("Heartbeat {Timestamp}", DateTimeOffset.UtcNow);
-            await File.WriteAllTextAsync(heartbeatPath, DateTimeOffset.UtcNow.ToString("O"), stoppingToken);
-            await File.AppendAllTextAsync(appLogPath, $"{DateTimeOffset.UtcNow:O} Heartbeat{Environment.NewLine}", stoppingToken);
-            await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+            try
+            {
+                var updates = await bot.GetUpdates(
+                    offset: offset,
+                    timeout: 30,
+                    allowedUpdates: [UpdateType.Message, UpdateType.CallbackQuery],
+                    cancellationToken: stoppingToken);
+
+                foreach (var update in updates)
+                {
+                    offset = update.Id + 1;
+                    await HandleUpdateAsync(bot, update, allowedUserId, groupChatId, stoppingToken);
+                }
+
+                await File.WriteAllTextAsync(heartbeatPath, DateTimeOffset.UtcNow.ToString("O"), stoppingToken);
+                await File.AppendAllTextAsync(appLogPath, $"{DateTimeOffset.UtcNow:O} Heartbeat{Environment.NewLine}", stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Polling loop failed");
+                await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
+            }
         }
+    }
+
+    private async Task HandleUpdateAsync(
+        TelegramBotClient bot,
+        Update update,
+        long allowedUserId,
+        long groupChatId,
+        CancellationToken cancellationToken)
+    {
+        var fromUserId = update.Message?.From?.Id ?? update.CallbackQuery?.From.Id;
+        var chatId = update.Message?.Chat.Id ?? update.CallbackQuery?.Message?.Chat.Id;
+        var threadId = update.Message?.MessageThreadId ?? update.CallbackQuery?.Message?.MessageThreadId;
+
+        logger.LogInformation(
+            "Update {Type}; chatId={ChatId}; threadId={ThreadId}; fromUser={FromUser}",
+            update.Type,
+            chatId,
+            threadId,
+            fromUserId);
+
+        if (fromUserId is null || fromUserId.Value != allowedUserId)
+        {
+            return;
+        }
+
+        if (update.Type == UpdateType.CallbackQuery && update.CallbackQuery is not null)
+        {
+            await HandleCallbackAsync(bot, update.CallbackQuery, groupChatId, cancellationToken);
+            return;
+        }
+
+        if (update.Type != UpdateType.Message || update.Message is null)
+        {
+            return;
+        }
+
+        var message = update.Message;
+        if (message.Type != MessageType.Text || string.IsNullOrWhiteSpace(message.Text))
+        {
+            return;
+        }
+
+        var command = ParseCommand(message.Text);
+        if (command == "/mkproj" && message.Chat.Type != ChatType.Private)
+        {
+            await HandleMkprojFromNonPrivateChatAsync(bot, message, groupChatId, cancellationToken);
+            return;
+        }
+
+        if (message.Chat.Type == ChatType.Private)
+        {
+            await HandlePrivateMessageAsync(bot, message, groupChatId, cancellationToken);
+            return;
+        }
+
+        if (message.Chat.Id == groupChatId && message.MessageThreadId.HasValue)
+        {
+            await HandleTopicMessageAsync(bot, message, cancellationToken);
+        }
+    }
+
+    private async Task HandlePrivateMessageAsync(TelegramBotClient bot, Message message, long groupChatId, CancellationToken cancellationToken)
+    {
+        var command = ParseCommand(message.Text!);
+        var userId = message.From!.Id;
+
+        switch (command)
+        {
+            case "/help":
+                await bot.SendMessage(
+                    chatId: message.Chat.Id,
+                    text: "Команды: /mkproj, /help.\n/mkproj открывает выбор директории и создаёт topic в группе.",
+                    cancellationToken: cancellationToken);
+                return;
+            case "/mkproj":
+                await StartMkprojSessionAsync(bot, message.Chat.Id, userId, groupChatId, cancellationToken);
+                return;
+        }
+
+        if (_mkprojSessions.TryGetValue(userId, out var session))
+        {
+            if (session.InputMode == MkprojInputMode.AwaitingSearch)
+            {
+                session.Filter = message.Text!.Trim();
+                session.InputMode = MkprojInputMode.None;
+                session.Page = 0;
+                await RenderSessionAsync(bot, session, cancellationToken);
+                return;
+            }
+
+            if (session.InputMode == MkprojInputMode.AwaitingPath)
+            {
+                await HandleEnteredPathAsync(bot, session, message.Text!, cancellationToken);
+                return;
+            }
+        }
+
+        await bot.SendMessage(
+            chatId: message.Chat.Id,
+            text: "Поддерживаются /mkproj и /help.",
+            cancellationToken: cancellationToken);
+    }
+
+    private async Task HandleMkprojFromNonPrivateChatAsync(
+        TelegramBotClient bot,
+        Message message,
+        long groupChatId,
+        CancellationToken cancellationToken)
+    {
+        var userId = message.From!.Id;
+        try
+        {
+            await StartMkprojSessionAsync(bot, userId, userId, groupChatId, cancellationToken);
+            await bot.SendMessage(
+                chatId: message.Chat.Id,
+                text: "Открыл выбор папки в личке с ботом.",
+                messageThreadId: message.MessageThreadId,
+                cancellationToken: cancellationToken);
+        }
+        catch (ApiRequestException ex) when (ex.ErrorCode == 403)
+        {
+            await bot.SendMessage(
+                chatId: message.Chat.Id,
+                text: "Не могу написать в личку. Сначала открой чат с ботом и нажми Start, потом повтори /mkproj.",
+                messageThreadId: message.MessageThreadId,
+                cancellationToken: cancellationToken);
+        }
+    }
+
+    private async Task HandleTopicMessageAsync(TelegramBotClient bot, Message message, CancellationToken cancellationToken)
+    {
+        var chatId = message.Chat.Id;
+        var threadId = message.MessageThreadId!.Value;
+        var command = ParseCommand(message.Text!);
+
+        switch (command)
+        {
+            case "/status":
+                await SendTopicStatusAsync(bot, chatId, threadId, cancellationToken);
+                return;
+            case "/cancel":
+                await codexRunner.CancelAsync(chatId, threadId, cancellationToken);
+                var topicToCancel = await stateStore.GetTopicByThreadIdAsync(chatId, threadId, cancellationToken);
+                if (topicToCancel is not null)
+                {
+                    await stateStore.FinishTopicJobAsync(topicToCancel.Id, "cancelled", cancellationToken);
+                }
+
+                await bot.SendMessage(chatId, "⏹ Остановлено.", messageThreadId: threadId, cancellationToken: cancellationToken);
+                return;
+            case "/new":
+                await bot.SendMessage(chatId, "ℹ️ /new будет реализован в следующих задачах.", messageThreadId: threadId, cancellationToken: cancellationToken);
+                return;
+        }
+
+        await RunTopicJobAsync(bot, chatId, threadId, message.Text!, cancellationToken);
+    }
+
+    private async Task SendTopicStatusAsync(TelegramBotClient bot, long chatId, int threadId, CancellationToken cancellationToken)
+    {
+        var topic = await stateStore.GetTopicByThreadIdAsync(chatId, threadId, cancellationToken);
+        if (topic is null)
+        {
+            await bot.SendMessage(chatId, "Топик не привязан к проекту.", messageThreadId: threadId, cancellationToken: cancellationToken);
+            return;
+        }
+
+        var status = $"busy={topic.Busy}, status={topic.Status}, context={topic.ContextLeftPercent?.ToString() ?? "??"}%";
+        await bot.SendMessage(chatId, $"📊 {status}", messageThreadId: threadId, cancellationToken: cancellationToken);
+    }
+
+    private async Task RunTopicJobAsync(
+        TelegramBotClient bot,
+        long chatId,
+        int threadId,
+        string prompt,
+        CancellationToken cancellationToken)
+    {
+        var topic = await stateStore.GetTopicByThreadIdAsync(chatId, threadId, cancellationToken);
+        if (topic is null)
+        {
+            await bot.SendMessage(chatId, "Топик не привязан к проекту. Создайте проект через /mkproj в личке.", messageThreadId: threadId, cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (topic.Busy)
+        {
+            await bot.SendMessage(chatId, "⏳ Сообщение проигнорировано: выполняется задача. Доступна команда /cancel.", messageThreadId: threadId, cancellationToken: cancellationToken);
+            return;
+        }
+
+        var project = await stateStore.GetProjectByIdAsync(topic.ProjectId, cancellationToken);
+        if (project is null)
+        {
+            await bot.SendMessage(chatId, "Ошибка: проект не найден в БД.", messageThreadId: threadId, cancellationToken: cancellationToken);
+            return;
+        }
+
+        await stateStore.StartTopicJobAsync(topic.Id, cancellationToken);
+        await bot.SendMessage(chatId, "🛠 Codex запущен", messageThreadId: threadId, cancellationToken: cancellationToken);
+
+        try
+        {
+            var request = new CodexRunRequest(chatId, threadId, project.DirPath, prompt);
+            await foreach (var update in codexRunner.RunAsync(request, cancellationToken))
+            {
+                if (string.IsNullOrWhiteSpace(update.Chunk))
+                {
+                    continue;
+                }
+
+                foreach (var chunk in SplitForTelegram(update.Chunk))
+                {
+                    await bot.SendMessage(chatId, chunk, messageThreadId: threadId, cancellationToken: cancellationToken);
+                }
+            }
+
+            await stateStore.FinishTopicJobAsync(topic.Id, "idle", cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            await stateStore.FinishTopicJobAsync(topic.Id, "cancelled", cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Topic job failed; chatId={ChatId}, threadId={ThreadId}", chatId, threadId);
+            await stateStore.FinishTopicJobAsync(topic.Id, "error", cancellationToken);
+            await bot.SendMessage(chatId, $"❌ Ошибка: {ex.Message}", messageThreadId: threadId, cancellationToken: cancellationToken);
+        }
+    }
+
+    private async Task StartMkprojSessionAsync(
+        TelegramBotClient bot,
+        long privateChatId,
+        long userId,
+        long groupChatId,
+        CancellationToken cancellationToken)
+    {
+        var startDirectory = GetInitialDirectory();
+        var session = new MkprojSession(userId, privateChatId, groupChatId)
+        {
+            CurrentDirectory = startDirectory
+        };
+
+        var view = BuildMkprojView(session);
+        var message = await bot.SendMessage(privateChatId, view.Text, replyMarkup: view.Keyboard, cancellationToken: cancellationToken);
+        session.MessageId = message.Id;
+        _mkprojSessions[userId] = session;
+    }
+
+    private async Task HandleCallbackAsync(TelegramBotClient bot, CallbackQuery callbackQuery, long groupChatId, CancellationToken cancellationToken)
+    {
+        if (callbackQuery.Message?.Chat.Type != ChatType.Private || string.IsNullOrWhiteSpace(callbackQuery.Data))
+        {
+            await bot.AnswerCallbackQuery(callbackQuery.Id, cancellationToken: cancellationToken);
+            return;
+        }
+
+        var userId = callbackQuery.From.Id;
+        if (!_mkprojSessions.TryGetValue(userId, out var session))
+        {
+            await bot.AnswerCallbackQuery(callbackQuery.Id, "Сессия не найдена. Введите /mkproj снова.", cancellationToken: cancellationToken);
+            return;
+        }
+
+        session.GroupChatId = groupChatId;
+
+        var data = callbackQuery.Data!;
+        if (data.StartsWith("mk:cd:", StringComparison.Ordinal))
+        {
+            if (int.TryParse(data["mk:cd:".Length..], out var index))
+            {
+                var entries = ListEntries(session);
+                if (index >= 0 && index < entries.Count)
+                {
+                    session.CurrentDirectory = entries[index].FullPath;
+                    session.Page = 0;
+                }
+            }
+        }
+        else if (data == "mk:up")
+        {
+            GoUp(session);
+        }
+        else if (data == "mk:prev")
+        {
+            if (session.Page > 0)
+            {
+                session.Page--;
+            }
+        }
+        else if (data == "mk:next")
+        {
+            var entries = ListEntries(session);
+            var totalPages = Math.Max(1, (int)Math.Ceiling(entries.Count / (double)PageSize));
+            if (session.Page + 1 < totalPages)
+            {
+                session.Page++;
+            }
+        }
+        else if (data == "mk:search")
+        {
+            session.InputMode = MkprojInputMode.AwaitingSearch;
+        }
+        else if (data == "mk:path")
+        {
+            session.InputMode = MkprojInputMode.AwaitingPath;
+        }
+        else if (data == "mk:select")
+        {
+            await bot.AnswerCallbackQuery(callbackQuery.Id, "Создаю проект...", cancellationToken: cancellationToken);
+            await CompleteSelectionAsync(bot, session, cancellationToken);
+            return;
+        }
+
+        await RenderSessionAsync(bot, session, cancellationToken);
+        await bot.AnswerCallbackQuery(callbackQuery.Id, cancellationToken: cancellationToken);
+    }
+
+    private async Task HandleEnteredPathAsync(TelegramBotClient bot, MkprojSession session, string rawPath, CancellationToken cancellationToken)
+    {
+        session.InputMode = MkprojInputMode.None;
+        var candidatePath = rawPath.Trim();
+        if (string.IsNullOrWhiteSpace(candidatePath))
+        {
+            await RenderSessionAsync(bot, session, cancellationToken);
+            return;
+        }
+
+        try
+        {
+            var fullPath = Path.GetFullPath(candidatePath);
+            if (!Directory.Exists(fullPath))
+            {
+                await bot.SendMessage(session.PrivateChatId, $"Папка не найдена: {fullPath}", cancellationToken: cancellationToken);
+                await RenderSessionAsync(bot, session, cancellationToken);
+                return;
+            }
+
+            session.CurrentDirectory = fullPath;
+            session.Page = 0;
+            await RenderSessionAsync(bot, session, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            await bot.SendMessage(session.PrivateChatId, $"Неверный путь: {ex.Message}", cancellationToken: cancellationToken);
+            await RenderSessionAsync(bot, session, cancellationToken);
+        }
+    }
+
+    private async Task CompleteSelectionAsync(TelegramBotClient bot, MkprojSession session, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(session.CurrentDirectory))
+        {
+            await bot.SendMessage(session.PrivateChatId, "Сначала выберите папку.", cancellationToken: cancellationToken);
+            return;
+        }
+
+        var selected = session.CurrentDirectory!;
+        if (!Directory.Exists(selected))
+        {
+            await bot.SendMessage(session.PrivateChatId, $"Папка недоступна: {selected}", cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (!pathPolicy.IsAllowed(selected))
+        {
+            await bot.SendMessage(session.PrivateChatId, $"Путь запрещён политикой: {selected}", cancellationToken: cancellationToken);
+            return;
+        }
+
+        try
+        {
+            _ = Directory.EnumerateDirectories(selected).Take(1).ToList();
+        }
+        catch (Exception ex)
+        {
+            await bot.SendMessage(session.PrivateChatId, $"Нет доступа к папке: {ex.Message}", cancellationToken: cancellationToken);
+            return;
+        }
+
+        await bot.EditMessageText(
+            session.PrivateChatId,
+            session.MessageId,
+            $"Создаю проект для {selected}...",
+            cancellationToken: cancellationToken);
+
+        var topicRecord = await CreateTopicForDirectoryAsync(bot, session.GroupChatId, selected, cancellationToken);
+        var projectName = Path.GetFileName(selected.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        var confirmation = $"Готово: создан topic {projectName} (thread {topicRecord.MessageThreadId})";
+
+        await bot.EditMessageText(
+            session.PrivateChatId,
+            session.MessageId,
+            confirmation,
+            cancellationToken: cancellationToken);
+
+        _mkprojSessions.TryRemove(session.UserId, out _);
+    }
+
+    private async Task<TopicRecord> CreateTopicForDirectoryAsync(
+        TelegramBotClient bot,
+        long groupChatId,
+        string selectedDirectory,
+        CancellationToken cancellationToken)
+    {
+        var project = await stateStore.GetOrCreateProjectAsync(selectedDirectory, cancellationToken);
+        var projectName = Path.GetFileName(selectedDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        if (string.IsNullOrWhiteSpace(projectName))
+        {
+            projectName = selectedDirectory;
+        }
+
+        var title = BuildInitialTopicTitle(projectName, selectedDirectory);
+        var forumTopic = await bot.CreateForumTopic(groupChatId, title, cancellationToken: cancellationToken);
+
+        var topic = await stateStore.CreateTopicAsync(
+            project.Id,
+            groupChatId,
+            forumTopic.MessageThreadId,
+            projectName,
+            cancellationToken);
+
+        await bot.SendMessage(
+            groupChatId,
+            "Привет! Этот topic привязан к директории проекта.\n" +
+            "Пишите обычный текст для запуска задачи Codex.\n" +
+            "Команды: /status, /cancel, /new",
+            messageThreadId: topic.MessageThreadId,
+            cancellationToken: cancellationToken);
+
+        return topic;
+    }
+
+    private async Task RenderSessionAsync(TelegramBotClient bot, MkprojSession session, CancellationToken cancellationToken)
+    {
+        var view = BuildMkprojView(session);
+        await bot.EditMessageText(
+            session.PrivateChatId,
+            session.MessageId,
+            view.Text,
+            replyMarkup: view.Keyboard,
+            cancellationToken: cancellationToken);
+    }
+
+    private MkprojView BuildMkprojView(MkprojSession session)
+    {
+        var entries = ListEntries(session);
+        var totalPages = Math.Max(1, (int)Math.Ceiling(entries.Count / (double)PageSize));
+        if (session.Page >= totalPages)
+        {
+            session.Page = totalPages - 1;
+        }
+
+        var start = session.Page * PageSize;
+        var pageEntries = entries.Skip(start).Take(PageSize).ToList();
+
+        var rows = new List<InlineKeyboardButton[]>();
+        foreach (var item in pageEntries)
+        {
+            rows.Add([InlineKeyboardButton.WithCallbackData($"📁 {item.Name}", $"mk:cd:{item.Index}")]);
+        }
+
+        rows.Add(
+        [
+            InlineKeyboardButton.WithCallbackData("⬆️ Up", "mk:up"),
+            InlineKeyboardButton.WithCallbackData("◀️ Prev", "mk:prev"),
+            InlineKeyboardButton.WithCallbackData("Next ▶️", "mk:next")
+        ]);
+        rows.Add(
+        [
+            InlineKeyboardButton.WithCallbackData("🔎 Search", "mk:search"),
+            InlineKeyboardButton.WithCallbackData("⌨️ Enter path", "mk:path"),
+            InlineKeyboardButton.WithCallbackData("✅ Select", "mk:select")
+        ]);
+
+        var text =
+            "🗂 Выбор директории\n" +
+            $"Текущая: {session.CurrentDirectory ?? "[Список дисков]"}\n" +
+            $"Элементов: {entries.Count} (показано максимум {MaxListElements})\n" +
+            $"Страница: {session.Page + 1}/{totalPages}\n" +
+            $"Фильтр: {(string.IsNullOrWhiteSpace(session.Filter) ? "нет" : session.Filter)}\n" +
+            (session.InputMode switch
+            {
+                MkprojInputMode.AwaitingSearch => "\nВведите текст поиска следующим сообщением.",
+                MkprojInputMode.AwaitingPath => "\nВведите полный путь следующим сообщением.",
+                _ => string.Empty
+            });
+
+        return new MkprojView(text, new InlineKeyboardMarkup(rows));
+    }
+
+    private List<MkprojEntry> ListEntries(MkprojSession session)
+    {
+        IEnumerable<string> candidates;
+
+        if (string.IsNullOrWhiteSpace(session.CurrentDirectory))
+        {
+            candidates = DriveInfo.GetDrives()
+                .Where(drive => drive.IsReady)
+                .Select(drive => drive.RootDirectory.FullName);
+        }
+        else
+        {
+            try
+            {
+                candidates = Directory.EnumerateDirectories(session.CurrentDirectory);
+            }
+            catch (Exception)
+            {
+                candidates = [];
+            }
+        }
+
+        var items = candidates
+            .Select(path => new DirectoryInfo(path))
+            .Where(info => !HiddenDirectoryNames.Contains(info.Name))
+            .OrderBy(info => info.Name, StringComparer.OrdinalIgnoreCase)
+            .Take(MaxListElements)
+            .ToList();
+
+        if (!string.IsNullOrWhiteSpace(session.Filter))
+        {
+            items = items
+                .Where(info => info.Name.Contains(session.Filter, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        }
+
+        var result = new List<MkprojEntry>(items.Count);
+        for (var i = 0; i < items.Count; i++)
+        {
+            var displayName = string.IsNullOrWhiteSpace(items[i].Name)
+                ? items[i].FullName
+                : items[i].Name;
+            result.Add(new MkprojEntry(i, displayName, items[i].FullName));
+        }
+
+        return result;
+    }
+
+    private static void GoUp(MkprojSession session)
+    {
+        if (string.IsNullOrWhiteSpace(session.CurrentDirectory))
+        {
+            return;
+        }
+
+        var parent = Directory.GetParent(session.CurrentDirectory);
+        session.CurrentDirectory = parent?.FullName;
+        session.Page = 0;
+    }
+
+    private static IEnumerable<string> SplitForTelegram(string text)
+    {
+        if (text.Length <= TelegramMessageLimit)
+        {
+            yield return text;
+            yield break;
+        }
+
+        var start = 0;
+        while (start < text.Length)
+        {
+            var length = Math.Min(TelegramMessageLimit, text.Length - start);
+            yield return text.Substring(start, length);
+            start += length;
+        }
+    }
+
+    private static string BuildInitialTopicTitle(string projectName, string directory)
+    {
+        return $"🟢 {projectName} · ??% · {GetTail(directory)}";
+    }
+
+    private static string GetTail(string path)
+    {
+        var parts = path
+            .Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries);
+
+        if (parts.Length == 0)
+        {
+            return path;
+        }
+
+        return parts.Length == 1 ? parts[0] : $"{parts[^2]}/{parts[^1]}";
+    }
+
+    private static string? ParseCommand(string text)
+    {
+        var firstToken = text.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(firstToken) || !firstToken.StartsWith('/'))
+        {
+            return null;
+        }
+
+        var atIndex = firstToken.IndexOf('@', StringComparison.Ordinal);
+        return atIndex > 0 ? firstToken[..atIndex] : firstToken;
+    }
+
+    private static string? GetInitialDirectory()
+    {
+        const string hostRoot = "/host";
+        if (Directory.Exists(hostRoot))
+        {
+            return hostRoot;
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            var firstDrive = DriveInfo.GetDrives().FirstOrDefault(drive => drive.IsReady);
+            return firstDrive?.RootDirectory.FullName;
+        }
+
+        return "/";
+    }
+
+    private static string GetRequired(string name)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new InvalidOperationException($"Environment variable '{name}' is required.");
+        }
+
+        return value;
+    }
+
+    private sealed class MkprojSession(long userId, long privateChatId, long groupChatId)
+    {
+        public long UserId { get; } = userId;
+        public long PrivateChatId { get; } = privateChatId;
+        public long GroupChatId { get; set; } = groupChatId;
+        public int MessageId { get; set; }
+        public string? CurrentDirectory { get; set; }
+        public int Page { get; set; }
+        public string? Filter { get; set; }
+        public MkprojInputMode InputMode { get; set; }
+    }
+
+    private sealed record MkprojEntry(int Index, string Name, string FullPath);
+    private sealed record MkprojView(string Text, InlineKeyboardMarkup Keyboard);
+
+    private enum MkprojInputMode
+    {
+        None,
+        AwaitingSearch,
+        AwaitingPath
     }
 }
