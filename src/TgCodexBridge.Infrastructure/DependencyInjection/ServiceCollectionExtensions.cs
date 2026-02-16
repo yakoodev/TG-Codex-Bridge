@@ -29,7 +29,11 @@ public static class ServiceCollectionExtensions
         });
 
         services.AddSingleton<ITelegramClient, ConsoleTelegramClient>();
-        services.AddSingleton<IStateStore, InMemoryStateStore>();
+        services.AddSingleton<IStateStore>(_ =>
+        {
+            var stateDir = configuration["STATE_DIR"] ?? "data";
+            return new SqliteStateStore(stateDir);
+        });
         services.AddSingleton<ICodexRunner, NoOpCodexRunner>();
         services.AddSingleton<ITopicTitleFormatter, DefaultTopicTitleFormatter>();
         services.AddSingleton<IPathPolicy, PathPolicy>();
