@@ -6,6 +6,7 @@
     restart: unless-stopped
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ALLOWED_USER_ID: ${ALLOWED_USER_ID}
       GROUP_CHAT_ID: ${GROUP_CHAT_ID}
       STATE_DIR: /data
@@ -17,4 +18,5 @@
       CANCEL_KILL_TIMEOUT_SEC: 5
     volumes:
       - ./data:/data
+      - ${CODEX_CONFIG_HOST_DIR:-C:/Users/Yakov.M/.codex}:/root/.codex
       - C:/:/host/C
