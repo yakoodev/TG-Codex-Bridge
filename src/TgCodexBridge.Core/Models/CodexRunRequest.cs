@@ -1,8 +1,10 @@
-namespace TgCodexBridge.Core.Models;
+﻿namespace TgCodexBridge.Core.Models;
 
 public sealed record CodexRunRequest(
     long ChatId,
     int MessageThreadId,
     string ProjectDirectory,
     string Prompt,
-    string? ResumeChatId = null);
+    string? ResumeChatId = null,
+    string? SandboxModeOverride = null,
+    bool StopOnCommandStart = false);

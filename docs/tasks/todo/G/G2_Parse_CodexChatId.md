@@ -1,16 +1,16 @@
-# G2 — Парсинг/обновление `codex_chat_id`
+﻿# G2 - Parse and persist `codex_chat_id`
 
-## Цель
-Сохранять `codex_chat_id`, чтобы работал авто-resume.
+## Status
+Not done.
 
-## Сделать
-- Собрать реальные примеры вывода `codex` (лог) и подобрать regex/эвристику.
-- Когда найден новый id — `UpdateTopicCodexChatId`.
-- Не ломаться, если id не нашёлся (просто оставить null).
+## Goal
+Extract Codex chat/session id from runner output and persist it to DB for future auto-resume.
 
-## Критерии приёмки
-- Если codex печатает id — мы его сохраняем.
-- Если не печатает — система всё равно работает (просто без resume).
+## Remaining work
+- Define stable parser for session id from Codex output events.
+- Update `topics.codex_chat_id` when id is found.
+- Keep system stable when id is absent.
 
-## Как проверить
-- Запустить сессию → проверить `topics.codex_chat_id` в БД.
+## Acceptance
+- At least one real run stores non-null `topics.codex_chat_id`.
+- Subsequent runs can use stored id for resume.

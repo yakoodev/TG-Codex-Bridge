@@ -1,25 +1,20 @@
-# F1 — Approval prompt: inline кнопки (y/p/esc) + ввод в stdin
+﻿# F1 - Approval Prompt UI (Partial)
 
-## Цель
-Когда codex спрашивает подтверждение команды — дать кнопки в Telegram и отправить выбор в codex.
+## Status
+Partially done.
 
-## Сделать
-- Детект строки:
-  - `Would you like to run the following command?`
-- Вытянуть команду `$ ...` и показать отдельным сообщением:
-  - Команда (моноширинно)
-  - Кнопки:
-    - `✅ Yes (y)` → `y\n`
-    - `✅✅ Yes always (p)` → `p\n`
-    - `❌ No (esc)` → отправить ESC (0x1B), затем `\n` (fallback)
-- После выбора:
-  - отредактировать сообщение “Выбрано: …”
-  - убрать клавиатуру (disable)
-  - продолжить job
+## Implemented
+- Bot detects command execution events and can show inline buttons:
+  - `Yes`
+  - `Yes always`
+  - `No`
+- Button state is persisted for the active prompt and message is edited after selection.
 
-## Критерии приёмки
-- Нажатие кнопки реально влияет на выполнение codex.
-- Нет двойных нажатий (кнопки выключаются).
+## Current limitation
+- `codex exec` (v0.101.0) does not provide interactive `approval_policy=on-request` behavior.
+- Because of this, current flow uses a bot-level approval gate and reruns the job after approval.
+- This means `Yes` does not continue the same Codex session in-place.
 
-## Как проверить
-- Добиться prompt → нажать `Yes` → codex продолжает и выполняет команду.
+## Remaining work
+- Replace rerun flow with true in-session approval once runner moves to interactive mode.
+- Keep Telegram buttons as UI layer over real in-session approvals.

@@ -15,3 +15,6 @@
 ## Соглашения
 - Каждая задача содержит: **Цель → Сделать → Критерии приёмки → Как проверить**.
 - Логи и state храним в `/data` внутри контейнера.
+
+## Current implementation status
+See `docs/tasks/STATUS.md` for actual done/todo state after recent changes.

@@ -1,16 +1,15 @@
-# E2 — Авто-resume по `codex_chat_id`
+﻿# E2 - Auto-resume by `codex_chat_id`
 
-## Цель
-Если в теме уже есть `codex_chat_id`, автоматически резюмить перед новым запросом.
+## Status
+Not done.
 
-## Сделать
-- Если `topics.codex_chat_id != null`:
-  - перед пользовательским текстом отправлять в stdin:
-    - `/resume {id}\n`
-- В TG лог-сообщение: `↩️ Resume: {id}` (не спамить, можно только при первом resume в job).
+## Goal
+If a topic already has `codex_chat_id`, automatically resume the same Codex chat before processing a new prompt.
 
-## Критерии приёмки
-- Второй запрос в том же topic помнит контекст (codex продолжает тот же чат).
+## Gaps
+- `topics.codex_chat_id` is currently not populated.
+- Runs start as new Codex threads.
 
-## Как проверить
-- 2 запроса подряд: первый “запомни X”, второй “что я просил?” → виден контекст.
+## Acceptance
+- Second prompt in same topic continues prior context.
+- Bot logs a single `Resume` status when resume is used.

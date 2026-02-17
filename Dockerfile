@@ -23,9 +23,8 @@ ENV LOG_DIR=/data/logs
 
 VOLUME ["/data"]
 
-# Install Node.js + npm and Codex CLI for Linux runtime.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl nodejs npm docker.io docker-compose-v2 \
     && npm install -g @openai/codex \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
