@@ -6,7 +6,7 @@ namespace TgCodexBridge.Infrastructure.Services;
 
 public sealed class SqliteStateStore : IStateStore
 {
-    private const int CurrentSchemaVersion = 1;
+    private const int CurrentSchemaVersion = 2;
     private static readonly byte[] SqliteHeader = "SQLite format 3\0"u8.ToArray();
 
     private readonly string _dbPath;
@@ -108,14 +108,16 @@ public sealed class SqliteStateStore : IStateStore
                     busy,
                     status,
                     context_left_percent,
+                    launch_backend,
                     last_job_started_at,
                     last_job_finished_at)
-                VALUES ($projectId, $groupChatId, $threadId, NULL, $name, 0, 'idle', NULL, NULL, NULL);
+                VALUES ($projectId, $groupChatId, $threadId, NULL, $name, 0, 'idle', NULL, $launchBackend, NULL, NULL);
                 """;
             insert.Parameters.AddWithValue("$projectId", projectId);
             insert.Parameters.AddWithValue("$groupChatId", groupChatId);
             insert.Parameters.AddWithValue("$threadId", threadId);
             insert.Parameters.AddWithValue("$name", name);
+            insert.Parameters.AddWithValue("$launchBackend", CodexLaunchBackend.Docker);
             await insert.ExecuteNonQueryAsync(cancellationToken);
         }
 
@@ -139,6 +141,7 @@ public sealed class SqliteStateStore : IStateStore
                    busy,
                    status,
                    context_left_percent,
+                   launch_backend,
                    last_job_started_at,
                    last_job_finished_at
             FROM topics
@@ -169,6 +172,17 @@ public sealed class SqliteStateStore : IStateStore
     public async Task UpdateTopicCodexChatIdAsync(long topicId, string? codexChatId, CancellationToken cancellationToken = default)
     {
         await ExecuteTopicUpdateAsync(topicId, "UPDATE topics SET codex_chat_id = $codexChatId WHERE id = $topicId;", cancellationToken, ("$codexChatId", codexChatId));
+    }
+
+    public async Task UpdateTopicLaunchBackendAsync(long topicId, string launchBackend, CancellationToken cancellationToken = default)
+    {
+        var normalized = CodexLaunchBackend.NormalizeOrDefault(launchBackend);
+        await ExecuteTopicUpdateAsync(topicId, "UPDATE topics SET launch_backend = $launchBackend WHERE id = $topicId;", cancellationToken, ("$launchBackend", normalized));
+    }
+
+    public async Task DeleteTopicAsync(long topicId, CancellationToken cancellationToken = default)
+    {
+        await ExecuteTopicUpdateAsync(topicId, "DELETE FROM topics WHERE id = $topicId;", cancellationToken);
     }
 
     public async Task<IReadOnlyList<long>> ListNotifyUsersAsync(CancellationToken cancellationToken = default)
@@ -319,6 +333,7 @@ public sealed class SqliteStateStore : IStateStore
                         busy INTEGER NOT NULL DEFAULT 0,
                         status TEXT NOT NULL DEFAULT 'idle',
                         context_left_percent INTEGER NULL,
+                        launch_backend TEXT NOT NULL DEFAULT 'docker',
                         last_job_started_at TEXT NULL,
                         last_job_finished_at TEXT NULL,
                         FOREIGN KEY(project_id) REFERENCES projects(id)
@@ -339,9 +354,23 @@ public sealed class SqliteStateStore : IStateStore
                     CREATE INDEX IF NOT EXISTS idx_topics_project_id ON topics(project_id);
                     CREATE INDEX IF NOT EXISTS idx_topics_message_thread_id ON topics(message_thread_id);
 
-                    UPDATE schema_version SET version = 1;
+                    UPDATE schema_version SET version = 2;
                     """;
                 await migration.ExecuteNonQueryAsync(cancellationToken);
+                version = 2;
+            }
+
+            if (version < 2)
+            {
+                await using var migration = connection.CreateCommand();
+                migration.Transaction = transaction;
+                migration.CommandText = """
+                    ALTER TABLE topics ADD COLUMN launch_backend TEXT NOT NULL DEFAULT 'docker';
+                    UPDATE topics SET launch_backend = 'docker' WHERE launch_backend IS NULL OR TRIM(launch_backend) = '';
+                    UPDATE schema_version SET version = 2;
+                    """;
+                await migration.ExecuteNonQueryAsync(cancellationToken);
+                version = 2;
             }
 
             transaction.Commit();
@@ -427,7 +456,8 @@ public sealed class SqliteStateStore : IStateStore
             Busy: reader.GetInt32(6) == 1,
             Status: reader.GetString(7),
             ContextLeftPercent: reader.IsDBNull(8) ? null : reader.GetInt32(8),
-            LastJobStartedAt: reader.IsDBNull(9) ? null : DateTimeOffset.Parse(reader.GetString(9)),
-            LastJobFinishedAt: reader.IsDBNull(10) ? null : DateTimeOffset.Parse(reader.GetString(10)));
+            LaunchBackend: reader.IsDBNull(9) ? CodexLaunchBackend.Docker : CodexLaunchBackend.NormalizeOrDefault(reader.GetString(9)),
+            LastJobStartedAt: reader.IsDBNull(10) ? null : DateTimeOffset.Parse(reader.GetString(10)),
+            LastJobFinishedAt: reader.IsDBNull(11) ? null : DateTimeOffset.Parse(reader.GetString(11)));
     }
 }

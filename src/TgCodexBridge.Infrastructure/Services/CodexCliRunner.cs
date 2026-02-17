@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using TgCodexBridge.Core.Abstractions;
@@ -14,6 +15,20 @@ namespace TgCodexBridge.Infrastructure.Services;
 public sealed class CodexCliRunner(ILogger<CodexCliRunner> logger) : ICodexRunner
 {
     private const int StderrTailLines = 20;
+    private static readonly HashSet<string> ChatIdPropertyNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "chat_id",
+        "chatId",
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        "conversationId",
+        "thread_id",
+        "threadId"
+    };
+    private static readonly Regex ContextPercentRegex =
+        new(@"(?im)\b(?:(?<percent>\d{1,3})\s*%\s*(?:context|remaining)|context(?:\s+window)?(?:\s+left|\s+remaining)?\s*[:=]?\s*(?<percent2>\d{1,3})\s*%)\b", RegexOptions.Compiled);
+
     private readonly ConcurrentDictionary<(long ChatId, int ThreadId), ActiveRun> _activeRuns = new();
 
     public async IAsyncEnumerable<CodexRunUpdate> RunAsync(
@@ -22,7 +37,7 @@ public sealed class CodexCliRunner(ILogger<CodexCliRunner> logger) : ICodexRunne
     {
         var key = (request.ChatId, request.MessageThreadId);
         var runCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var activeRun = new ActiveRun(runCts);
+        var activeRun = new ActiveRun(runCts, request.ProjectDirectory, request.Prompt);
 
         if (!_activeRuns.TryAdd(key, activeRun))
         {
@@ -31,15 +46,8 @@ public sealed class CodexCliRunner(ILogger<CodexCliRunner> logger) : ICodexRunne
 
         try
         {
-            var codexBin = Environment.GetEnvironmentVariable("CODEX_BIN");
-            if (string.IsNullOrWhiteSpace(codexBin))
-            {
-                codexBin = "codex";
-            }
-
             var startInfo = new ProcessStartInfo
             {
-                FileName = codexBin,
                 WorkingDirectory = request.ProjectDirectory,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -48,27 +56,7 @@ public sealed class CodexCliRunner(ILogger<CodexCliRunner> logger) : ICodexRunne
                 CreateNoWindow = true
             };
 
-            startInfo.ArgumentList.Add("exec");
-            startInfo.ArgumentList.Add("--json");
-            startInfo.ArgumentList.Add("--skip-git-repo-check");
-            startInfo.ArgumentList.Add("--sandbox");
-            startInfo.ArgumentList.Add(request.SandboxModeOverride ?? (Environment.GetEnvironmentVariable("CODEX_SANDBOX_MODE") ?? "workspace-write"));
-
-            if (IsTrue(Environment.GetEnvironmentVariable("CODEX_ENABLE_WEB_SEARCH")))
-            {
-                startInfo.ArgumentList.Add("--search");
-            }
-
-            if (!string.IsNullOrWhiteSpace(request.ResumeChatId))
-            {
-                startInfo.ArgumentList.Add("resume");
-                startInfo.ArgumentList.Add(request.ResumeChatId!);
-                startInfo.ArgumentList.Add(request.Prompt);
-            }
-            else
-            {
-                startInfo.ArgumentList.Add(request.Prompt);
-            }
+            ConfigureStartInfo(startInfo, request);
 
             using var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             activeRun.AttachProcess(process);
@@ -167,6 +155,19 @@ public sealed class CodexCliRunner(ILogger<CodexCliRunner> logger) : ICodexRunne
         return activeRun.SendInputAsync(input, cancellationToken);
     }
 
+    public IReadOnlyList<CodexActiveRunInfo> GetActiveRuns()
+    {
+        return _activeRuns
+            .Select(static pair => new CodexActiveRunInfo(
+                pair.Key.ChatId,
+                pair.Key.ThreadId,
+                pair.Value.StartedAt,
+                pair.Value.ProjectDirectory,
+                pair.Value.Prompt))
+            .OrderBy(info => info.StartedAt)
+            .ToArray();
+    }
+
     private static int ReadTimeout(string envName, int fallbackSeconds)
     {
         var raw = Environment.GetEnvironmentVariable(envName);
@@ -183,6 +184,9 @@ public sealed class CodexCliRunner(ILogger<CodexCliRunner> logger) : ICodexRunne
         ChannelWriter<CodexRunUpdate> writer,
         CancellationToken cancellationToken)
     {
+        string? lastCodexChatId;
+        lastCodexChatId = null;
+
         while (!reader.EndOfStream && !cancellationToken.IsCancellationRequested)
         {
             var line = await reader.ReadLineAsync(cancellationToken);
@@ -194,6 +198,13 @@ public sealed class CodexCliRunner(ILogger<CodexCliRunner> logger) : ICodexRunne
             if (ShouldLogJsonEvents())
             {
                 logger.LogInformation("Codex stdout event: {JsonLine}", line);
+            }
+
+            if (TryExtractCodexChatId(line, out var codexChatId) &&
+                !string.Equals(codexChatId, lastCodexChatId, StringComparison.Ordinal))
+            {
+                lastCodexChatId = codexChatId;
+                await writer.WriteAsync(new CodexRunUpdate(string.Empty, Kind: "meta", CodexChatId: codexChatId), cancellationToken);
             }
 
             if (TryExtractDisplayUpdateFromJsonLine(line, out var update) && !string.IsNullOrWhiteSpace(update.Chunk))
@@ -250,6 +261,18 @@ public sealed class CodexCliRunner(ILogger<CodexCliRunner> logger) : ICodexRunne
             }
 
             var eventType = eventTypeElement.GetString();
+            if (string.Equals(eventType, "turn.completed", StringComparison.OrdinalIgnoreCase))
+            {
+                var contextPercent = TryExtractContextLeftPercent(root);
+                if (contextPercent.HasValue)
+                {
+                    update = new CodexRunUpdate($"Context left: {contextPercent.Value}%", Kind: "status");
+                    return true;
+                }
+
+                return false;
+            }
+
             if (!string.Equals(eventType, "item.completed", StringComparison.OrdinalIgnoreCase) &&
                 !string.Equals(eventType, "item.started", StringComparison.OrdinalIgnoreCase))
             {
@@ -320,6 +343,253 @@ public sealed class CodexCliRunner(ILogger<CodexCliRunner> logger) : ICodexRunne
         }
     }
 
+    private static bool TryExtractCodexChatId(string line, out string codexChatId)
+    {
+        codexChatId = string.Empty;
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        if (line[0] == '{')
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                if (root.ValueKind == JsonValueKind.Object &&
+                    root.TryGetProperty("type", out var typeElement) &&
+                    string.Equals(typeElement.GetString(), "thread.started", StringComparison.OrdinalIgnoreCase) &&
+                    root.TryGetProperty("thread_id", out var threadIdElement) &&
+                    threadIdElement.ValueKind == JsonValueKind.String)
+                {
+                    var threadId = threadIdElement.GetString();
+                    if (!string.IsNullOrWhiteSpace(threadId))
+                    {
+                        codexChatId = threadId.Trim();
+                        return true;
+                    }
+                }
+
+                if (TryExtractCodexChatIdFromJsonElement(doc.RootElement, out codexChatId))
+                {
+                    return true;
+                }
+            }
+            catch (JsonException)
+            {
+                // Non-JSON fallback below.
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryExtractCodexChatIdFromJsonElement(JsonElement element, out string codexChatId)
+    {
+        codexChatId = string.Empty;
+
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in element.EnumerateObject())
+            {
+                if (property.Value.ValueKind == JsonValueKind.String &&
+                    ChatIdPropertyNames.Contains(property.Name))
+                {
+                    var value = property.Value.GetString();
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        codexChatId = value.Trim();
+                        return true;
+                    }
+                }
+
+                if (TryExtractCodexChatIdFromJsonElement(property.Value, out codexChatId))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                if (TryExtractCodexChatIdFromJsonElement(item, out codexChatId))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static int? TryExtractContextLeftPercent(JsonElement root)
+    {
+        if (TryExtractContextLeftPercentFromJson(root, out var percent))
+        {
+            return Math.Clamp(percent, 0, 100);
+        }
+
+        var raw = root.ToString();
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        var match = ContextPercentRegex.Match(raw);
+        if (!match.Success)
+        {
+            return null;
+        }
+
+        var percentText = match.Groups["percent"].Success
+            ? match.Groups["percent"].Value
+            : match.Groups["percent2"].Value;
+        return int.TryParse(percentText, out percent)
+            ? Math.Clamp(percent, 0, 100)
+            : null;
+
+    }
+
+    private static bool TryExtractContextLeftPercentFromJson(JsonElement element, out int percent)
+    {
+        percent = 0;
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in element.EnumerateObject())
+            {
+                if (IsContextPercentKey(property.Name) &&
+                    TryParsePercentJsonValue(property.Value, out percent))
+                {
+                    return true;
+                }
+
+                if (TryExtractContextLeftPercentFromJson(property.Value, out percent))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                if (TryExtractContextLeftPercentFromJson(item, out percent))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsContextPercentKey(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        var normalized = name.Replace("-", "_", StringComparison.Ordinal).ToLowerInvariant();
+        if (normalized is "context_left_percent" or "contextleftpercent" or "remaining_context_percent" or "remainingcontextpercent")
+        {
+            return true;
+        }
+
+        var hasContext = normalized.Contains("context", StringComparison.Ordinal);
+        var hasPercent = normalized.Contains("percent", StringComparison.Ordinal) || normalized.Contains("pct", StringComparison.Ordinal);
+        var hasRemaining = normalized.Contains("left", StringComparison.Ordinal) ||
+                           normalized.Contains("remain", StringComparison.Ordinal) ||
+                           normalized.Contains("window", StringComparison.Ordinal);
+
+        return hasContext && hasPercent && hasRemaining;
+    }
+
+    private static bool TryParsePercentJsonValue(JsonElement value, out int percent)
+    {
+        percent = 0;
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out percent))
+        {
+            percent = Math.Clamp(percent, 0, 100);
+            return true;
+        }
+
+        if (value.ValueKind == JsonValueKind.Number)
+        {
+            if (value.TryGetDouble(out var ratio))
+            {
+                if (ratio is >= 0 and <= 1)
+                {
+                    percent = (int)Math.Round(ratio * 100, MidpointRounding.AwayFromZero);
+                    percent = Math.Clamp(percent, 0, 100);
+                    return true;
+                }
+
+                if (ratio is > 1 and <= 100)
+                {
+                    percent = (int)Math.Round(ratio, MidpointRounding.AwayFromZero);
+                    percent = Math.Clamp(percent, 0, 100);
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        if (value.ValueKind != JsonValueKind.String)
+        {
+            return false;
+        }
+
+        var text = value.GetString();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var match = ContextPercentRegex.Match(text);
+        if (!match.Success)
+        {
+            return false;
+        }
+
+        var raw = match.Groups["percent"].Success
+            ? match.Groups["percent"].Value
+            : match.Groups["percent2"].Value;
+
+        if (!int.TryParse(raw, out percent))
+        {
+            if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var ratio))
+            {
+                return false;
+            }
+
+            if (ratio is >= 0 and <= 1)
+            {
+                percent = (int)Math.Round(ratio * 100, MidpointRounding.AwayFromZero);
+            }
+            else if (ratio is > 1 and <= 100)
+            {
+                percent = (int)Math.Round(ratio, MidpointRounding.AwayFromZero);
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        percent = Math.Clamp(percent, 0, 100);
+        return true;
+    }
+
     private static async Task CompleteChannelWhenReadersFinishAsync(ChannelWriter<CodexRunUpdate> writer, params Task[] readerTasks)
     {
         try
@@ -379,6 +649,109 @@ public sealed class CodexCliRunner(ILogger<CodexCliRunner> logger) : ICodexRunne
         return $"{startInfo.FileName} {string.Join(' ', args)}".TrimEnd();
     }
 
+    private static void ConfigureStartInfo(ProcessStartInfo startInfo, CodexRunRequest request)
+    {
+        var backend = CodexLaunchBackend.NormalizeOrDefault(request.LaunchBackend);
+        var sandbox = request.SandboxModeOverride ?? (Environment.GetEnvironmentVariable("CODEX_SANDBOX_MODE") ?? "workspace-write");
+        var enableSearch = IsTrue(Environment.GetEnvironmentVariable("CODEX_ENABLE_WEB_SEARCH"));
+        var approvalMode = Environment.GetEnvironmentVariable("CODEX_APPROVAL_MODE");
+        if (string.IsNullOrWhiteSpace(approvalMode))
+        {
+            approvalMode = "untrusted";
+        }
+
+        var codexArgs = BuildCodexExecArgs(request, sandbox, enableSearch);
+        var preArgs = new List<string> { "-a", approvalMode.Trim() };
+        switch (backend)
+        {
+            case CodexLaunchBackend.Windows:
+            {
+                startInfo.FileName = Environment.GetEnvironmentVariable("CODEX_BIN_WINDOWS") ??
+                                     Environment.GetEnvironmentVariable("CODEX_BIN") ??
+                                     "codex";
+                foreach (var arg in preArgs)
+                {
+                    startInfo.ArgumentList.Add(arg);
+                }
+                foreach (var arg in codexArgs)
+                {
+                    startInfo.ArgumentList.Add(arg);
+                }
+
+                break;
+            }
+            case CodexLaunchBackend.Wsl:
+            {
+                startInfo.FileName = Environment.GetEnvironmentVariable("CODEX_BIN_WSL") ?? "wsl";
+                var distro = Environment.GetEnvironmentVariable("CODEX_WSL_DISTRO");
+                if (!string.IsNullOrWhiteSpace(distro))
+                {
+                    startInfo.ArgumentList.Add("-d");
+                    startInfo.ArgumentList.Add(distro.Trim());
+                }
+
+                startInfo.ArgumentList.Add("--cd");
+                startInfo.ArgumentList.Add(request.ProjectDirectory);
+                startInfo.ArgumentList.Add("--");
+                startInfo.ArgumentList.Add(Environment.GetEnvironmentVariable("CODEX_WSL_CODEX_BIN") ?? "codex");
+                foreach (var arg in preArgs)
+                {
+                    startInfo.ArgumentList.Add(arg);
+                }
+                foreach (var arg in codexArgs)
+                {
+                    startInfo.ArgumentList.Add(arg);
+                }
+
+                break;
+            }
+            default:
+            {
+                startInfo.FileName = Environment.GetEnvironmentVariable("CODEX_BIN_DOCKER") ??
+                                     Environment.GetEnvironmentVariable("CODEX_BIN") ??
+                                     "codex";
+                foreach (var arg in preArgs)
+                {
+                    startInfo.ArgumentList.Add(arg);
+                }
+                foreach (var arg in codexArgs)
+                {
+                    startInfo.ArgumentList.Add(arg);
+                }
+
+                break;
+            }
+        }
+    }
+
+    private static List<string> BuildCodexExecArgs(CodexRunRequest request, string sandbox, bool enableSearch)
+    {
+        var args = new List<string>
+        {
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "--sandbox",
+            sandbox
+        };
+
+        if (enableSearch)
+        {
+            args.Add("--search");
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.ResumeChatId))
+        {
+            args.Add("resume");
+            args.Add(request.ResumeChatId!);
+            args.Add(request.Prompt);
+            return args;
+        }
+
+        args.Add(request.Prompt);
+        return args;
+    }
+
     private static string EscapeArg(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -420,10 +793,14 @@ public sealed class CodexCliRunner(ILogger<CodexCliRunner> logger) : ICodexRunne
         return new InvalidOperationException($"{message} Exit code: {exitCode}. Stderr tail:{Environment.NewLine}{tail}");
     }
 
-    private sealed class ActiveRun(CancellationTokenSource cts)
+    private sealed class ActiveRun(CancellationTokenSource cts, string projectDirectory, string prompt)
     {
         private readonly object _sync = new();
         private Process? _process;
+
+        public DateTimeOffset StartedAt { get; } = DateTimeOffset.UtcNow;
+        public string ProjectDirectory { get; } = projectDirectory;
+        public string Prompt { get; } = prompt;
 
         public void AttachProcess(Process process)
         {

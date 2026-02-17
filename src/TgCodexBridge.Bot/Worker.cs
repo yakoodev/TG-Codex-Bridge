@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Hosting;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -24,7 +24,14 @@ public sealed class Worker(
     private const int MaxListElements = 300;
     private const int TelegramMessageLimit = 4000;
     private static readonly TimeSpan TitleUpdateDebounce = TimeSpan.FromSeconds(2);
-    private static readonly Regex ContextLeftRegex = new(@"\b(?<percent>\d{1,3})\s*%\s*context\s+left\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ContextLeftRegex =
+        new(@"\b(?<percent>\d{1,3})\s*%\s*(?:context\s+left|remaining(?:\s+context)?|context\s+remaining)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ContextLeftReverseRegex =
+        new(@"\bcontext(?:\s+window)?\s*(?:left|remaining)\s*[:=]?\s*(?<percent>\d{1,3})\s*%\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ContextLeftAssignmentRegex =
+        new(@"\bcontext(?:_left|(?:\s+left)|(?:\s+remaining))?\s*[:=]\s*(?<percent>\d{1,3})\s*%\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex SandboxDeniedRegex =
+        new(@"(?im)\b(read-?only|permission denied|operation not permitted|sandbox|только\s+для\s+чтения|заблокир(?:ован|ована)\s+политикой|доступ\s+запрещ[её]н)\b", RegexOptions.Compiled);
     private static readonly Regex ApprovalCommandRegex = new(@"(?m)^\$\s*(?<cmd>.+?)\s*$", RegexOptions.Compiled);
     private static readonly string[] ApprovalPromptMarkers =
     [
@@ -48,7 +55,7 @@ public sealed class Worker(
     private readonly ConcurrentDictionary<long, MkprojSession> _mkprojSessions = new();
     private readonly ConcurrentDictionary<(long ChatId, int ThreadId), DateTimeOffset> _lastTitleUpdateAt = new();
     private readonly ConcurrentDictionary<(long ChatId, int ThreadId), PendingApproval> _pendingApprovals = new();
-    private readonly ConcurrentDictionary<(long ChatId, int ThreadId), bool> _approvalAlwaysTopics = new();
+    private readonly ConcurrentDictionary<(long ChatId, int ThreadId), int> _pendingDeleteConfirmations = new();
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -241,6 +248,9 @@ public sealed class Worker(
             case "/status":
                 await SendTopicStatusAsync(bot, chatId, threadId, cancellationToken);
                 return;
+            case "/chats":
+                await SendActiveChatsAsync(bot, chatId, threadId, cancellationToken);
+                return;
             case "/cancel":
                 await codexRunner.CancelAsync(chatId, threadId, cancellationToken);
                 var topicToCancel = await stateStore.GetTopicByThreadIdAsync(chatId, threadId, cancellationToken);
@@ -254,11 +264,119 @@ public sealed class Worker(
                 await bot.SendMessage(chatId, "Cancelled by user.", messageThreadId: threadId, cancellationToken: cancellationToken);
                 return;
             case "/new":
-                await bot.SendMessage(chatId, "ℹ️ /new будет реализован в следующих задачах.", messageThreadId: threadId, cancellationToken: cancellationToken);
+                await HandleNewTopicCommandAsync(bot, chatId, threadId, cancellationToken);
+                return;
+            case "/backend":
+                await HandleBackendCommandAsync(bot, chatId, threadId, message.Text!, cancellationToken);
+                return;
+            case "/delete":
+                await DeleteCurrentTopicAsync(bot, chatId, threadId, cancellationToken);
                 return;
         }
 
-        await RunTopicJobAsync(bot, chatId, threadId, message.Text!, RunLaunchMode.Normal, cancellationToken);
+        LaunchTopicJob(bot, chatId, threadId, message.Text!, RunLaunchMode.Normal, cancellationToken);
+    }
+
+    private async Task HandleNewTopicCommandAsync(TelegramBotClient bot, long chatId, int threadId, CancellationToken cancellationToken)
+    {
+        var sourceTopic = await stateStore.GetTopicByThreadIdAsync(chatId, threadId, cancellationToken);
+        if (sourceTopic is null)
+        {
+            await bot.SendMessage(chatId, "Топик не привязан к проекту.", messageThreadId: threadId, cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (sourceTopic.Busy)
+        {
+            await bot.SendMessage(chatId, "⏳ Нельзя выполнить /new, пока текущий topic занят. Доступна команда /cancel.", messageThreadId: threadId, cancellationToken: cancellationToken);
+            return;
+        }
+
+        var project = await stateStore.GetProjectByIdAsync(sourceTopic.ProjectId, cancellationToken);
+        if (project is null)
+        {
+            await bot.SendMessage(chatId, "Ошибка: проект не найден в БД.", messageThreadId: threadId, cancellationToken: cancellationToken);
+            return;
+        }
+
+        var newTopic = await CreateTopicForDirectoryAsync(bot, chatId, project.DirPath, cancellationToken);
+
+        await bot.SendMessage(
+            chatId,
+            $"🆕 Создан новый topic (thread {newTopic.MessageThreadId}). Инициализирую новую сессию Codex...",
+            messageThreadId: threadId,
+            cancellationToken: cancellationToken);
+
+        LaunchTopicJob(bot, chatId, newTopic.MessageThreadId, "/new", RunLaunchMode.Normal, cancellationToken);
+    }
+
+    private void LaunchTopicJob(TelegramBotClient bot, long chatId, int threadId, string prompt, RunLaunchMode launchMode, CancellationToken cancellationToken)
+    {
+        _ = Task.Run(
+            async () =>
+            {
+                try
+                {
+                    await RunTopicJobAsync(bot, chatId, threadId, prompt, launchMode, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Background topic job failed; chatId={ChatId}, threadId={ThreadId}", chatId, threadId);
+                }
+            },
+            CancellationToken.None);
+    }
+
+    private async Task SendActiveChatsAsync(TelegramBotClient bot, long chatId, int threadId, CancellationToken cancellationToken)
+    {
+        var runs = codexRunner.GetActiveRuns();
+        if (runs.Count == 0)
+        {
+            await bot.SendMessage(chatId, "Сейчас нет активных codex-чатов.", messageThreadId: threadId, cancellationToken: cancellationToken);
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var lines = runs.Select((run, index) =>
+        {
+            var elapsed = now - run.StartedAt;
+            var prompt = run.Prompt.Length > 60 ? $"{run.Prompt[..60]}..." : run.Prompt;
+            return $"{index + 1}. thread={run.MessageThreadId}, started={run.StartedAt:O}, elapsed={elapsed:hh\\:mm\\:ss}, prompt={prompt}";
+        });
+
+        var text = "Активные codex-рансы:\n" + string.Join('\n', lines);
+        await bot.SendMessage(chatId, EscapeTelegramHtml(text), parseMode: ParseMode.Html, messageThreadId: threadId, cancellationToken: cancellationToken);
+    }
+
+    private async Task DeleteCurrentTopicAsync(TelegramBotClient bot, long chatId, int threadId, CancellationToken cancellationToken)
+    {
+        var key = (chatId, threadId);
+        if (_pendingDeleteConfirmations.TryRemove(key, out var oldMessageId))
+        {
+            try
+            {
+                await bot.EditMessageReplyMarkup(chatId, oldMessageId, replyMarkup: null, cancellationToken: cancellationToken);
+            }
+            catch (ApiRequestException)
+            {
+                // Ignore stale confirmations.
+            }
+        }
+
+        var confirmation = await bot.SendMessage(
+            chatId,
+            "⚠️ Точно удаляем этот topic?",
+            messageThreadId: threadId,
+            replyMarkup: new InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton.WithCallbackData("Да, удалить", "del:yes"),
+                    InlineKeyboardButton.WithCallbackData("Отмена", "del:no")
+                ]
+            ]),
+            cancellationToken: cancellationToken);
+
+        _pendingDeleteConfirmations[key] = confirmation.Id;
     }
 
     private async Task SendTopicStatusAsync(TelegramBotClient bot, long chatId, int threadId, CancellationToken cancellationToken)
@@ -270,8 +388,60 @@ public sealed class Worker(
             return;
         }
 
-        var status = $"busy={topic.Busy}, status={topic.Status}, context={topic.ContextLeftPercent?.ToString() ?? "??"}%";
+        var contextPart = topic.ContextLeftPercent.HasValue
+            ? $"{topic.ContextLeftPercent.Value}%"
+            : "n/a";
+        var status = $"busy={topic.Busy}, status={topic.Status}, backend={topic.LaunchBackend}, context={contextPart}";
         await bot.SendMessage(chatId, $"📊 {status}", messageThreadId: threadId, cancellationToken: cancellationToken);
+    }
+
+    private async Task HandleBackendCommandAsync(
+        TelegramBotClient bot,
+        long chatId,
+        int threadId,
+        string rawText,
+        CancellationToken cancellationToken)
+    {
+        var topic = await stateStore.GetTopicByThreadIdAsync(chatId, threadId, cancellationToken);
+        if (topic is null)
+        {
+            await bot.SendMessage(chatId, "Топик не привязан к проекту.", messageThreadId: threadId, cancellationToken: cancellationToken);
+            return;
+        }
+
+        var parts = rawText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 1)
+        {
+            await bot.SendMessage(
+                chatId,
+                $"Текущий backend: <b>{EscapeTelegramHtml(topic.LaunchBackend)}</b>\nИспользование: <code>/backend docker</code> | <code>/backend windows</code> | <code>/backend wsl</code>",
+                parseMode: ParseMode.Html,
+                messageThreadId: threadId,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (topic.Busy)
+        {
+            await bot.SendMessage(chatId, "Нельзя менять backend во время активной задачи.", messageThreadId: threadId, cancellationToken: cancellationToken);
+            return;
+        }
+
+        var requested = parts[1].Trim();
+        if (!CodexLaunchBackend.IsSupported(requested))
+        {
+            await bot.SendMessage(chatId, "Поддерживаются только: docker, windows, wsl.", messageThreadId: threadId, cancellationToken: cancellationToken);
+            return;
+        }
+
+        var normalized = CodexLaunchBackend.NormalizeOrDefault(requested);
+        await stateStore.UpdateTopicLaunchBackendAsync(topic.Id, normalized, cancellationToken);
+        await bot.SendMessage(
+            chatId,
+            $"Backend переключен на: <b>{EscapeTelegramHtml(normalized)}</b>",
+            parseMode: ParseMode.Html,
+            messageThreadId: threadId,
+            cancellationToken: cancellationToken);
     }
 
     private async Task RunTopicJobAsync(
@@ -304,25 +474,17 @@ public sealed class Worker(
 
         await stateStore.StartTopicJobAsync(topic.Id, cancellationToken);
         await RefreshTopicTitleAsync(bot, topic with { Busy = true, Status = "working" }, cancellationToken, force: true);
-        await SendFormattedOutputAsync(bot, chatId, threadId, "status", "🛠 Codex запущен", cancellationToken);
         var keepPendingApproval = false;
+
+        if (!string.IsNullOrWhiteSpace(topic.CodexChatId) && !IsLikelyCodexChatId(topic.CodexChatId))
+        {
+            topic = topic with { CodexChatId = null };
+            await stateStore.UpdateTopicCodexChatIdAsync(topic.Id, null, cancellationToken);
+        }
 
         try
         {
-            if (!string.IsNullOrWhiteSpace(topic.CodexChatId))
-            {
-                await SendFormattedOutputAsync(bot, chatId, threadId, "status", $"↩️ Resume: {topic.CodexChatId}", cancellationToken);
-            }
-
-            var alwaysApproved = _approvalAlwaysTopics.ContainsKey((chatId, threadId));
-            var useApprovalGate = launchMode == RunLaunchMode.Normal && !alwaysApproved;
-            var sandboxMode = launchMode switch
-            {
-                RunLaunchMode.Approved => "danger-full-access",
-                RunLaunchMode.ApprovedAlways => "danger-full-access",
-                _ when alwaysApproved => "danger-full-access",
-                _ => "read-only"
-            };
+            var sandboxMode = Environment.GetEnvironmentVariable("CODEX_SANDBOX_MODE") ?? "workspace-write";
 
             var request = new CodexRunRequest(
                 chatId,
@@ -330,8 +492,9 @@ public sealed class Worker(
                 project.DirPath,
                 prompt,
                 topic.CodexChatId,
+                topic.LaunchBackend,
                 SandboxModeOverride: sandboxMode,
-                StopOnCommandStart: useApprovalGate);
+                StopOnCommandStart: false);
             await foreach (var update in codexRunner.RunAsync(request, cancellationToken))
             {
                 logger.LogInformation(
@@ -342,6 +505,21 @@ public sealed class Worker(
                     update.Chunk?.Length ?? 0);
 
                 var chunk = update.Chunk ?? string.Empty;
+                var parsedCodexChatId = update.CodexChatId;
+
+                if (!string.IsNullOrWhiteSpace(parsedCodexChatId) &&
+                    IsLikelyCodexChatId(parsedCodexChatId) &&
+                    !string.Equals(parsedCodexChatId, topic.CodexChatId, StringComparison.Ordinal))
+                {
+                    topic = topic with { CodexChatId = parsedCodexChatId };
+                    await stateStore.UpdateTopicCodexChatIdAsync(topic.Id, parsedCodexChatId, cancellationToken);
+                    logger.LogInformation(
+                        "Stored codex_chat_id; chatId={ChatId}, threadId={ThreadId}, codexChatId={CodexChatId}",
+                        chatId,
+                        threadId,
+                        parsedCodexChatId);
+                }
+
                 var contextLeftPercent = ParseContextLeftPercent(chunk);
                 if (contextLeftPercent.HasValue && contextLeftPercent != topic.ContextLeftPercent)
                 {
@@ -350,19 +528,24 @@ public sealed class Worker(
                     await RefreshTopicTitleAsync(bot, topic with { Busy = true, Status = "working" }, cancellationToken);
                 }
 
-                if (TryExtractApprovalCommand(chunk, out var approvalCommand))
+                if (string.IsNullOrWhiteSpace(chunk))
                 {
-                    logger.LogInformation(
-                        "Approval prompt detected; chatId={ChatId}, threadId={ThreadId}, command={Command}",
-                        chatId,
-                        threadId,
-                        approvalCommand);
-                    await ShowApprovalPromptAsync(bot, chatId, threadId, approvalCommand, prompt, cancellationToken);
                     continue;
                 }
 
-                if (string.IsNullOrWhiteSpace(chunk))
+                if (string.Equals(update.Kind, "status", StringComparison.OrdinalIgnoreCase) &&
+                    IsContextOnlyStatus(chunk))
                 {
+                    continue;
+                }
+
+                if (TryExtractApprovalCommand(chunk, out var approvalCommand))
+                {
+                    await stateStore.UpdateTopicStatusAsync(topic.Id, "waiting_approval", cancellationToken);
+                    topic = topic with { Status = "waiting_approval" };
+                    await RefreshTopicTitleAsync(bot, topic with { Busy = true }, cancellationToken, force: true);
+                    await ShowApprovalPromptAsync(bot, chatId, threadId, approvalCommand, prompt, isNativeInput: true, cancellationToken);
+                    keepPendingApproval = true;
                     continue;
                 }
 
@@ -376,8 +559,7 @@ public sealed class Worker(
         {
             await stateStore.FinishTopicJobAsync(topic.Id, "waiting_approval", cancellationToken);
             topic = topic with { Busy = false, Status = "waiting_approval" };
-            await RefreshTopicTitleAsync(bot, topic, cancellationToken, force: true);
-            await ShowApprovalPromptAsync(bot, chatId, threadId, ex.Command, prompt, cancellationToken);
+            await ShowApprovalPromptAsync(bot, chatId, threadId, ex.Command, prompt, isNativeInput: true, cancellationToken);
             keepPendingApproval = true;
         }
         catch (OperationCanceledException)
@@ -433,6 +615,12 @@ public sealed class Worker(
         if (callbackQuery.Data.StartsWith("appr:", StringComparison.Ordinal))
         {
             await HandleApprovalCallbackAsync(bot, callbackQuery, cancellationToken);
+            return;
+        }
+
+        if (callbackQuery.Data.StartsWith("del:", StringComparison.Ordinal))
+        {
+            await HandleDeleteCallbackAsync(bot, callbackQuery, cancellationToken);
             return;
         }
 
@@ -523,7 +711,7 @@ public sealed class Worker(
         var label = choice switch
         {
             "y" => "Yes (y)",
-            "p" => "Yes always (p)",
+            "p" => "Yes (y)",
             "n" => "No (esc)",
             _ => "Yes (y)"
         };
@@ -545,6 +733,22 @@ public sealed class Worker(
 
         await bot.AnswerCallbackQuery(callbackQuery.Id, label, cancellationToken: cancellationToken);
 
+        if (pending.IsNativeInput)
+        {
+            var input = choice == "n" ? "n\n" : "y\n";
+            await codexRunner.SendInputAsync(key.ChatId, key.ThreadId, input, cancellationToken);
+            if (choice == "n")
+            {
+                await bot.SendMessage(
+                    key.ChatId,
+                    "Команда отклонена пользователем.",
+                    messageThreadId: key.ThreadId,
+                    cancellationToken: cancellationToken);
+            }
+
+            return;
+        }
+
         if (choice == "n")
         {
             await bot.SendMessage(
@@ -555,25 +759,73 @@ public sealed class Worker(
             return;
         }
 
-        if (choice == "p")
+        LaunchTopicJob(bot, key.ChatId, key.ThreadId, pending.OriginalPrompt, RunLaunchMode.Normal, cancellationToken);
+    }
+
+    private async Task HandleDeleteCallbackAsync(TelegramBotClient bot, CallbackQuery callbackQuery, CancellationToken cancellationToken)
+    {
+        var threadId = callbackQuery.Message?.MessageThreadId;
+        if (!threadId.HasValue || callbackQuery.Message is null)
         {
-            _approvalAlwaysTopics[(key.ChatId, key.ThreadId)] = true;
+            await bot.AnswerCallbackQuery(callbackQuery.Id, cancellationToken: cancellationToken);
+            return;
         }
 
-        var launchMode = choice == "p" ? RunLaunchMode.ApprovedAlways : RunLaunchMode.Approved;
-        _ = Task.Run(
-            async () =>
-            {
-                try
-                {
-                    await RunTopicJobAsync(bot, key.ChatId, key.ThreadId, pending.OriginalPrompt, launchMode, CancellationToken.None);
-                }
-                catch (Exception ex)
-                {
-                    logger.LogError(ex, "Failed to continue job after approval; chatId={ChatId}, threadId={ThreadId}", key.ChatId, key.ThreadId);
-                }
-            },
-            CancellationToken.None);
+        var key = (ChatId: callbackQuery.Message.Chat.Id, ThreadId: threadId.Value);
+        if (!_pendingDeleteConfirmations.TryGetValue(key, out var expectedMessageId) || expectedMessageId != callbackQuery.Message.Id)
+        {
+            await bot.AnswerCallbackQuery(callbackQuery.Id, "Подтверждение удаления не активно.", cancellationToken: cancellationToken);
+            return;
+        }
+
+        var action = callbackQuery.Data!["del:".Length..];
+        if (action == "no")
+        {
+            _pendingDeleteConfirmations.TryRemove(key, out _);
+            await bot.EditMessageText(
+                key.ChatId,
+                callbackQuery.Message.Id,
+                "Удаление отменено.",
+                replyMarkup: null,
+                cancellationToken: cancellationToken);
+            await bot.AnswerCallbackQuery(callbackQuery.Id, "Отмена", cancellationToken: cancellationToken);
+            return;
+        }
+
+        _pendingDeleteConfirmations.TryRemove(key, out _);
+
+        var topic = await stateStore.GetTopicByThreadIdAsync(key.ChatId, key.ThreadId, cancellationToken);
+        if (topic is not null && topic.Busy)
+        {
+            await codexRunner.CancelAsync(key.ChatId, key.ThreadId, cancellationToken);
+            await stateStore.FinishTopicJobAsync(topic.Id, "cancelled", cancellationToken);
+        }
+
+        _pendingApprovals.TryRemove(key, out _);
+
+        try
+        {
+            await bot.DeleteForumTopic(key.ChatId, key.ThreadId, cancellationToken: cancellationToken);
+        }
+        catch (ApiRequestException ex)
+        {
+            logger.LogWarning(ex, "Failed to delete Telegram topic; chatId={ChatId}, threadId={ThreadId}", key.ChatId, key.ThreadId);
+            await bot.EditMessageText(
+                key.ChatId,
+                callbackQuery.Message.Id,
+                $"Не удалось удалить topic: {ex.Message}",
+                replyMarkup: null,
+                cancellationToken: cancellationToken);
+            await bot.AnswerCallbackQuery(callbackQuery.Id, "Ошибка удаления", cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (topic is not null)
+        {
+            await stateStore.DeleteTopicAsync(topic.Id, cancellationToken);
+        }
+
+        await bot.AnswerCallbackQuery(callbackQuery.Id, "Topic удалён", cancellationToken: cancellationToken);
     }
 
     private async Task HandleEnteredPathAsync(TelegramBotClient bot, MkprojSession session, string rawPath, CancellationToken cancellationToken)
@@ -684,7 +936,7 @@ public sealed class Worker(
             groupChatId,
             "Привет! Этот topic привязан к директории проекта.\n" +
             "Пишите обычный текст для запуска задачи Codex.\n" +
-            "Команды: /status, /cancel, /new",
+            "Команды: /status, /backend, /chats, /cancel, /new, /delete",
             messageThreadId: topic.MessageThreadId,
             cancellationToken: cancellationToken);
 
@@ -1039,6 +1291,7 @@ public sealed class Worker(
         int threadId,
         string command,
         string originalPrompt,
+        bool isNativeInput,
         CancellationToken cancellationToken)
     {
         var promptHtml =
@@ -1057,7 +1310,7 @@ public sealed class Worker(
                     replyMarkup: BuildApprovalKeyboard(),
                     cancellationToken: cancellationToken);
 
-                _pendingApprovals[(chatId, threadId)] = existing with { PromptHtml = promptHtml, Command = command, OriginalPrompt = originalPrompt };
+                _pendingApprovals[(chatId, threadId)] = existing with { PromptHtml = promptHtml, Command = command, OriginalPrompt = originalPrompt, IsNativeInput = isNativeInput };
                 return;
             }
             catch (ApiRequestException)
@@ -1074,7 +1327,7 @@ public sealed class Worker(
             replyMarkup: BuildApprovalKeyboard(),
             cancellationToken: cancellationToken);
 
-        _pendingApprovals[(chatId, threadId)] = new PendingApproval(message.Id, promptHtml, command, originalPrompt);
+        _pendingApprovals[(chatId, threadId)] = new PendingApproval(message.Id, promptHtml, command, originalPrompt, isNativeInput);
     }
 
     private static InlineKeyboardMarkup BuildApprovalKeyboard()
@@ -1083,7 +1336,6 @@ public sealed class Worker(
         [
             [
                 InlineKeyboardButton.WithCallbackData("Yes (y)", "appr:y"),
-                InlineKeyboardButton.WithCallbackData("Yes always (p)", "appr:p"),
                 InlineKeyboardButton.WithCallbackData("No (esc)", "appr:n")
             ]
         ]);
@@ -1131,12 +1383,69 @@ public sealed class Worker(
         }
 
         var match = ContextLeftRegex.Match(text);
+        if (!match.Success)
+        {
+            match = ContextLeftReverseRegex.Match(text);
+        }
+        if (!match.Success)
+        {
+            match = ContextLeftAssignmentRegex.Match(text);
+        }
+
         if (!match.Success || !int.TryParse(match.Groups["percent"].Value, out var percent))
         {
             return null;
         }
 
         return Math.Clamp(percent, 0, 100);
+    }
+
+    private static bool IsSandboxDeniedText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        return SandboxDeniedRegex.IsMatch(text);
+    }
+
+    private static bool IsContextOnlyStatus(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var trimmed = text.Trim();
+        if (trimmed.StartsWith("Tokens:", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return trimmed.StartsWith("Context left:", StringComparison.OrdinalIgnoreCase) ||
+               ParseContextLeftPercent(trimmed).HasValue;
+    }
+
+    private static bool IsLikelyCodexChatId(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var trimmed = value.Trim();
+        if (trimmed.Length < 12)
+        {
+            return false;
+        }
+
+        if (trimmed.All(char.IsDigit))
+        {
+            return false;
+        }
+
+        return trimmed.Contains('-', StringComparison.Ordinal) || trimmed.Contains('_', StringComparison.Ordinal);
     }
 
     private static string? ParseCommand(string text)
@@ -1226,15 +1535,13 @@ public sealed class Worker(
         public MkprojInputMode InputMode { get; set; }
     }
 
-    private sealed record PendingApproval(int MessageId, string PromptHtml, string Command, string OriginalPrompt);
+    private sealed record PendingApproval(int MessageId, string PromptHtml, string Command, string OriginalPrompt, bool IsNativeInput);
     private sealed record MkprojEntry(int Index, string Name, string FullPath);
     private sealed record MkprojView(string Text, InlineKeyboardMarkup Keyboard);
 
     private enum RunLaunchMode
     {
-        Normal,
-        Approved,
-        ApprovedAlways
+        Normal
     }
 
     private enum MkprojInputMode

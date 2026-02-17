@@ -6,5 +6,6 @@ public sealed record CodexRunRequest(
     string ProjectDirectory,
     string Prompt,
     string? ResumeChatId = null,
+    string? LaunchBackend = null,
     string? SandboxModeOverride = null,
     bool StopOnCommandStart = false);

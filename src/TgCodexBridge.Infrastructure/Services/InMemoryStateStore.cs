@@ -50,6 +50,7 @@ public sealed class InMemoryStateStore : IStateStore
             Busy: false,
             Status: "idle",
             ContextLeftPercent: null,
+            LaunchBackend: CodexLaunchBackend.Docker,
             LastJobStartedAt: null,
             LastJobFinishedAt: null);
 
@@ -89,6 +90,23 @@ public sealed class InMemoryStateStore : IStateStore
     public Task UpdateTopicCodexChatIdAsync(long topicId, string? codexChatId, CancellationToken cancellationToken = default)
     {
         Update(topicId, t => t with { CodexChatId = codexChatId });
+        return Task.CompletedTask;
+    }
+
+    public Task UpdateTopicLaunchBackendAsync(long topicId, string launchBackend, CancellationToken cancellationToken = default)
+    {
+        var normalized = CodexLaunchBackend.NormalizeOrDefault(launchBackend);
+        Update(topicId, t => t with { LaunchBackend = normalized });
+        return Task.CompletedTask;
+    }
+
+    public Task DeleteTopicAsync(long topicId, CancellationToken cancellationToken = default)
+    {
+        if (_topicsById.TryRemove(topicId, out var topic))
+        {
+            _topicIdByThread.TryRemove((topic.GroupChatId, topic.MessageThreadId), out _);
+        }
+
         return Task.CompletedTask;
     }
 

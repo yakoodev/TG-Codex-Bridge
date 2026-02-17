@@ -22,4 +22,9 @@ public sealed class NoOpCodexRunner : ICodexRunner
     {
         return Task.CompletedTask;
     }
+
+    public IReadOnlyList<CodexActiveRunInfo> GetActiveRuns()
+    {
+        return [];
+    }
 }

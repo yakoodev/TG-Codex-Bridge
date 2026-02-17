@@ -1,20 +1,19 @@
-﻿# F1 - Approval Prompt UI (Partial)
+# F1 - Approval Prompt UI
 
 ## Status
-Partially done.
+Done (within current `codex exec` limitations).
 
 ## Implemented
-- Bot detects command execution events and can show inline buttons:
+- Bot detects command execution events and shows inline buttons:
   - `Yes`
   - `Yes always`
   - `No`
-- Button state is persisted for the active prompt and message is edited after selection.
+- Selection state is persisted for the active prompt.
+- Prompt message is edited after selection.
+- `Yes` / `Yes always` continues via bot-side rerun flow, `No` stops the task.
 
-## Current limitation
-- `codex exec` (v0.101.0) does not provide interactive `approval_policy=on-request` behavior.
-- Because of this, current flow uses a bot-level approval gate and reruns the job after approval.
-- This means `Yes` does not continue the same Codex session in-place.
+## Limitation
+- `codex exec` (v0.101.0) still does not support true interactive `approval_policy=on-request` continuation in the same process.
 
 ## Remaining work
-- Replace rerun flow with true in-session approval once runner moves to interactive mode.
-- Keep Telegram buttons as UI layer over real in-session approvals.
+- Switch from rerun flow to in-session approvals when CLI supports interactive mode.

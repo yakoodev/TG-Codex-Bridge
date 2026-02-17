@@ -9,11 +9,11 @@ public sealed class DefaultTopicTitleFormatter : ITopicTitleFormatter
     public string Format(string projectName, string directoryPath, bool isBusy, int? contextLeftPercent = null, string? status = null)
     {
         var emoji = ResolveEmoji(isBusy, status);
-        var normalizedContext = contextLeftPercent.HasValue
-            ? Math.Clamp(contextLeftPercent.Value, 0, 100).ToString()
-            : "??";
+        var contextPart = contextLeftPercent.HasValue
+            ? $"{Math.Clamp(contextLeftPercent.Value, 0, 100)}%"
+            : "n/a";
 
-        var title = $"{emoji} {projectName} · {normalizedContext}% · {GetTail(directoryPath)}";
+        var title = $"{emoji} {projectName} \u00B7 {contextPart} \u00B7 {GetTail(directoryPath)}";
         return title.Length < 120 ? title : title[..MaxTitleLength];
     }
 
@@ -21,15 +21,15 @@ public sealed class DefaultTopicTitleFormatter : ITopicTitleFormatter
     {
         if (isBusy)
         {
-            return "🟡";
+            return "\uD83D\uDFE1";
         }
 
         if (status is "error" or "cancelled")
         {
-            return "🔴";
+            return "\uD83D\uDD34";
         }
 
-        return "🟢";
+        return "\uD83D\uDFE2";
     }
 
     private static string GetTail(string path)

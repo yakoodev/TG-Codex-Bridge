@@ -10,5 +10,6 @@ public sealed record TopicRecord(
     bool Busy,
     string Status,
     int? ContextLeftPercent,
+    string LaunchBackend,
     DateTimeOffset? LastJobStartedAt,
     DateTimeOffset? LastJobFinishedAt);
