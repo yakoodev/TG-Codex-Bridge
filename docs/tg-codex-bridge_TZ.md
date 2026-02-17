@@ -453,3 +453,7 @@ $ Remove-Item tasks\todo\004-pin-dotnet-sdk-with-global-json.md -Force
 - Docker image собирается и запускается по инструкции.
 - Бот стабильно обрабатывает минимум 30 последовательных задач без утечек процессов.
 - При падении Codex/ошибке бот корректно переводит Topic в 🔴 и сообщает причину.
+
+## Implementation note (2026-02-17)
+Actual status is tracked in `docs/tasks/STATUS.md`.
+If behavior differs from this specification, trust status file and code as source of truth.
