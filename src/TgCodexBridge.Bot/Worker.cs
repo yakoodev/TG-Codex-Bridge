@@ -26,7 +26,15 @@ public sealed class Worker(
     private static readonly TimeSpan TitleUpdateDebounce = TimeSpan.FromSeconds(2);
     private static readonly Regex ContextLeftRegex = new(@"\b(?<percent>\d{1,3})\s*%\s*context\s+left\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex ApprovalCommandRegex = new(@"(?m)^\$\s*(?<cmd>.+?)\s*$", RegexOptions.Compiled);
-    private const string ApprovalPromptMarker = "Would you like to run the following command?";
+    private static readonly string[] ApprovalPromptMarkers =
+    [
+        "Would you like to run the following command?",
+        "Would you like to run this command?",
+        "run the following command",
+        "run this command"
+    ];
+    private static readonly Regex ApprovalFencedCommandRegex =
+        new(@"```(?:bash|sh|zsh|pwsh|powershell)?\s*(?<cmd>.+?)\s*```", RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.Compiled);
     private static readonly HashSet<string> HiddenDirectoryNames = new(StringComparer.OrdinalIgnoreCase)
     {
         ".git",
@@ -40,6 +48,7 @@ public sealed class Worker(
     private readonly ConcurrentDictionary<long, MkprojSession> _mkprojSessions = new();
     private readonly ConcurrentDictionary<(long ChatId, int ThreadId), DateTimeOffset> _lastTitleUpdateAt = new();
     private readonly ConcurrentDictionary<(long ChatId, int ThreadId), PendingApproval> _pendingApprovals = new();
+    private readonly ConcurrentDictionary<(long ChatId, int ThreadId), bool> _approvalAlwaysTopics = new();
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -249,7 +258,7 @@ public sealed class Worker(
                 return;
         }
 
-        await RunTopicJobAsync(bot, chatId, threadId, message.Text!, cancellationToken);
+        await RunTopicJobAsync(bot, chatId, threadId, message.Text!, RunLaunchMode.Normal, cancellationToken);
     }
 
     private async Task SendTopicStatusAsync(TelegramBotClient bot, long chatId, int threadId, CancellationToken cancellationToken)
@@ -270,6 +279,7 @@ public sealed class Worker(
         long chatId,
         int threadId,
         string prompt,
+        RunLaunchMode launchMode,
         CancellationToken cancellationToken)
     {
         var topic = await stateStore.GetTopicByThreadIdAsync(chatId, threadId, cancellationToken);
@@ -295,6 +305,7 @@ public sealed class Worker(
         await stateStore.StartTopicJobAsync(topic.Id, cancellationToken);
         await RefreshTopicTitleAsync(bot, topic with { Busy = true, Status = "working" }, cancellationToken, force: true);
         await SendFormattedOutputAsync(bot, chatId, threadId, "status", "🛠 Codex запущен", cancellationToken);
+        var keepPendingApproval = false;
 
         try
         {
@@ -303,10 +314,35 @@ public sealed class Worker(
                 await SendFormattedOutputAsync(bot, chatId, threadId, "status", $"↩️ Resume: {topic.CodexChatId}", cancellationToken);
             }
 
-            var request = new CodexRunRequest(chatId, threadId, project.DirPath, prompt, topic.CodexChatId);
+            var alwaysApproved = _approvalAlwaysTopics.ContainsKey((chatId, threadId));
+            var useApprovalGate = launchMode == RunLaunchMode.Normal && !alwaysApproved;
+            var sandboxMode = launchMode switch
+            {
+                RunLaunchMode.Approved => "danger-full-access",
+                RunLaunchMode.ApprovedAlways => "danger-full-access",
+                _ when alwaysApproved => "danger-full-access",
+                _ => "read-only"
+            };
+
+            var request = new CodexRunRequest(
+                chatId,
+                threadId,
+                project.DirPath,
+                prompt,
+                topic.CodexChatId,
+                SandboxModeOverride: sandboxMode,
+                StopOnCommandStart: useApprovalGate);
             await foreach (var update in codexRunner.RunAsync(request, cancellationToken))
             {
-                var contextLeftPercent = ParseContextLeftPercent(update.Chunk);
+                logger.LogInformation(
+                    "Codex update; chatId={ChatId}, threadId={ThreadId}, kind={Kind}, size={Size}",
+                    chatId,
+                    threadId,
+                    update.Kind,
+                    update.Chunk?.Length ?? 0);
+
+                var chunk = update.Chunk ?? string.Empty;
+                var contextLeftPercent = ParseContextLeftPercent(chunk);
                 if (contextLeftPercent.HasValue && contextLeftPercent != topic.ContextLeftPercent)
                 {
                     topic = topic with { ContextLeftPercent = contextLeftPercent };
@@ -314,22 +350,35 @@ public sealed class Worker(
                     await RefreshTopicTitleAsync(bot, topic with { Busy = true, Status = "working" }, cancellationToken);
                 }
 
-                if (TryExtractApprovalCommand(update.Chunk, out var approvalCommand))
+                if (TryExtractApprovalCommand(chunk, out var approvalCommand))
                 {
-                    await ShowApprovalPromptAsync(bot, chatId, threadId, approvalCommand, cancellationToken);
+                    logger.LogInformation(
+                        "Approval prompt detected; chatId={ChatId}, threadId={ThreadId}, command={Command}",
+                        chatId,
+                        threadId,
+                        approvalCommand);
+                    await ShowApprovalPromptAsync(bot, chatId, threadId, approvalCommand, prompt, cancellationToken);
                     continue;
                 }
 
-                if (string.IsNullOrWhiteSpace(update.Chunk))
+                if (string.IsNullOrWhiteSpace(chunk))
                 {
                     continue;
                 }
 
-                await SendFormattedOutputAsync(bot, chatId, threadId, update.Kind, update.Chunk, cancellationToken);
+                await SendFormattedOutputAsync(bot, chatId, threadId, update.Kind, chunk, cancellationToken);
             }
             await stateStore.FinishTopicJobAsync(topic.Id, "idle", cancellationToken);
             topic = topic with { Busy = false, Status = "idle" };
             await RefreshTopicTitleAsync(bot, topic, cancellationToken, force: true);
+        }
+        catch (CodexApprovalRequiredException ex)
+        {
+            await stateStore.FinishTopicJobAsync(topic.Id, "waiting_approval", cancellationToken);
+            topic = topic with { Busy = false, Status = "waiting_approval" };
+            await RefreshTopicTitleAsync(bot, topic, cancellationToken, force: true);
+            await ShowApprovalPromptAsync(bot, chatId, threadId, ex.Command, prompt, cancellationToken);
+            keepPendingApproval = true;
         }
         catch (OperationCanceledException)
         {
@@ -347,7 +396,10 @@ public sealed class Worker(
         }
         finally
         {
-            _pendingApprovals.TryRemove((chatId, threadId), out _);
+            if (!keepPendingApproval)
+            {
+                _pendingApprovals.TryRemove((chatId, threadId), out _);
+            }
         }
     }
 
@@ -468,15 +520,13 @@ public sealed class Worker(
         }
 
         var choice = callbackQuery.Data!["appr:".Length..];
-        var (input, label) = choice switch
+        var label = choice switch
         {
-            "y" => ("y\n", "Yes (y)"),
-            "p" => ("p\n", "Yes always (p)"),
-            "n" => ("\u001B\n", "No (esc)"),
-            _ => ("y\n", "Yes (y)")
+            "y" => "Yes (y)",
+            "p" => "Yes always (p)",
+            "n" => "No (esc)",
+            _ => "Yes (y)"
         };
-
-        await codexRunner.SendInputAsync(key.ChatId, key.ThreadId, input, cancellationToken);
 
         try
         {
@@ -494,6 +544,36 @@ public sealed class Worker(
         }
 
         await bot.AnswerCallbackQuery(callbackQuery.Id, label, cancellationToken: cancellationToken);
+
+        if (choice == "n")
+        {
+            await bot.SendMessage(
+                key.ChatId,
+                "Команда отклонена. Задача остановлена.",
+                messageThreadId: key.ThreadId,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (choice == "p")
+        {
+            _approvalAlwaysTopics[(key.ChatId, key.ThreadId)] = true;
+        }
+
+        var launchMode = choice == "p" ? RunLaunchMode.ApprovedAlways : RunLaunchMode.Approved;
+        _ = Task.Run(
+            async () =>
+            {
+                try
+                {
+                    await RunTopicJobAsync(bot, key.ChatId, key.ThreadId, pending.OriginalPrompt, launchMode, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Failed to continue job after approval; chatId={ChatId}, threadId={ThreadId}", key.ChatId, key.ThreadId);
+                }
+            },
+            CancellationToken.None);
     }
 
     private async Task HandleEnteredPathAsync(TelegramBotClient bot, MkprojSession session, string rawPath, CancellationToken cancellationToken)
@@ -804,6 +884,11 @@ public sealed class Worker(
             return $"<b>{EscapeTelegramHtml(text)}</b>";
         }
 
+        if (string.Equals(text.Trim(), "Completed", StringComparison.OrdinalIgnoreCase))
+        {
+            return "<b>✅ Completed</b>";
+        }
+
         return WrapExpandableQuote(EscapeTelegramHtml(text));
     }
 
@@ -953,6 +1038,7 @@ public sealed class Worker(
         long chatId,
         int threadId,
         string command,
+        string originalPrompt,
         CancellationToken cancellationToken)
     {
         var promptHtml =
@@ -971,7 +1057,7 @@ public sealed class Worker(
                     replyMarkup: BuildApprovalKeyboard(),
                     cancellationToken: cancellationToken);
 
-                _pendingApprovals[(chatId, threadId)] = existing with { PromptHtml = promptHtml };
+                _pendingApprovals[(chatId, threadId)] = existing with { PromptHtml = promptHtml, Command = command, OriginalPrompt = originalPrompt };
                 return;
             }
             catch (ApiRequestException)
@@ -988,7 +1074,7 @@ public sealed class Worker(
             replyMarkup: BuildApprovalKeyboard(),
             cancellationToken: cancellationToken);
 
-        _pendingApprovals[(chatId, threadId)] = new PendingApproval(message.Id, promptHtml);
+        _pendingApprovals[(chatId, threadId)] = new PendingApproval(message.Id, promptHtml, command, originalPrompt);
     }
 
     private static InlineKeyboardMarkup BuildApprovalKeyboard()
@@ -1006,9 +1092,25 @@ public sealed class Worker(
     private static bool TryExtractApprovalCommand(string text, out string command)
     {
         command = string.Empty;
-        if (string.IsNullOrWhiteSpace(text) || !text.Contains(ApprovalPromptMarker, StringComparison.Ordinal))
+        if (string.IsNullOrWhiteSpace(text))
         {
             return false;
+        }
+
+        var looksLikeApproval = ApprovalPromptMarkers.Any(marker => text.Contains(marker, StringComparison.OrdinalIgnoreCase));
+        if (!looksLikeApproval)
+        {
+            return false;
+        }
+
+        var fencedMatch = ApprovalFencedCommandRegex.Match(text);
+        if (fencedMatch.Success)
+        {
+            command = fencedMatch.Groups["cmd"].Value.Trim();
+            if (!string.IsNullOrWhiteSpace(command))
+            {
+                return true;
+            }
         }
 
         var match = ApprovalCommandRegex.Match(text);
@@ -1124,9 +1226,16 @@ public sealed class Worker(
         public MkprojInputMode InputMode { get; set; }
     }
 
-    private sealed record PendingApproval(int MessageId, string PromptHtml);
+    private sealed record PendingApproval(int MessageId, string PromptHtml, string Command, string OriginalPrompt);
     private sealed record MkprojEntry(int Index, string Name, string FullPath);
     private sealed record MkprojView(string Text, InlineKeyboardMarkup Keyboard);
+
+    private enum RunLaunchMode
+    {
+        Normal,
+        Approved,
+        ApprovedAlways
+    }
 
     private enum MkprojInputMode
     {

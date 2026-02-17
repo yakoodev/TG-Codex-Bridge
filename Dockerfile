@@ -23,6 +23,12 @@ ENV LOG_DIR=/data/logs
 
 VOLUME ["/data"]
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl nodejs npm docker.io docker-compose-v2 \
+    && npm install -g @openai/codex \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /app/publish .
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["/bin/sh", "-c", "test -f /data/heartbeat && test -f /data/state.db && test -d /data/logs"]

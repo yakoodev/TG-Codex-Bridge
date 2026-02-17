@@ -5,4 +5,6 @@ public sealed record CodexRunRequest(
     int MessageThreadId,
     string ProjectDirectory,
     string Prompt,
-    string? ResumeChatId = null);
+    string? ResumeChatId = null,
+    string? SandboxModeOverride = null,
+    bool StopOnCommandStart = false);

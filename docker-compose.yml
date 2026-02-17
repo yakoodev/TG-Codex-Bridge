@@ -11,10 +11,24 @@
       STATE_DIR: /data
       LOG_DIR: /data/logs
       CODEX_BIN: codex
+      CODEX_HOME: /root/.codex
+      CODEX_LOG_JSON_EVENTS: ${CODEX_LOG_JSON_EVENTS:-true}
+      CODEX_SANDBOX_MODE: ${CODEX_SANDBOX_MODE:-danger-full-access}
+      CODEX_ENABLE_WEB_SEARCH: ${CODEX_ENABLE_WEB_SEARCH:-false}
       PATH_POLICY_MODE: all
       ALLOWED_ROOTS: ${ALLOWED_ROOTS:-}
       CANCEL_SOFT_TIMEOUT_SEC: 10
       CANCEL_KILL_TIMEOUT_SEC: 5
+      Logging__LogLevel__Default: ${LOG_LEVEL_DEFAULT:-Information}
+      Logging__LogLevel__TgCodexBridge.Bot.Worker: ${LOG_LEVEL_WORKER:-Information}
+      Logging__LogLevel__TgCodexBridge.Infrastructure.Services.CodexCliRunner: ${LOG_LEVEL_CODEX_RUNNER:-Information}
     volumes:
       - ./data:/data
       - C:/:/host/C
+      - ${USERPROFILE}/.codex:/root/.codex
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

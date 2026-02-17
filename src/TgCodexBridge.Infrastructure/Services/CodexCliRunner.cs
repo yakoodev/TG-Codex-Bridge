@@ -5,12 +5,13 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
+using Microsoft.Extensions.Logging;
 using TgCodexBridge.Core.Abstractions;
 using TgCodexBridge.Core.Models;
 
 namespace TgCodexBridge.Infrastructure.Services;
 
-public sealed class CodexCliRunner : ICodexRunner
+public sealed class CodexCliRunner(ILogger<CodexCliRunner> logger) : ICodexRunner
 {
     private const int StderrTailLines = 20;
     private readonly ConcurrentDictionary<(long ChatId, int ThreadId), ActiveRun> _activeRuns = new();
@@ -50,6 +51,13 @@ public sealed class CodexCliRunner : ICodexRunner
             startInfo.ArgumentList.Add("exec");
             startInfo.ArgumentList.Add("--json");
             startInfo.ArgumentList.Add("--skip-git-repo-check");
+            startInfo.ArgumentList.Add("--sandbox");
+            startInfo.ArgumentList.Add(request.SandboxModeOverride ?? (Environment.GetEnvironmentVariable("CODEX_SANDBOX_MODE") ?? "workspace-write"));
+
+            if (IsTrue(Environment.GetEnvironmentVariable("CODEX_ENABLE_WEB_SEARCH")))
+            {
+                startInfo.ArgumentList.Add("--search");
+            }
 
             if (!string.IsNullOrWhiteSpace(request.ResumeChatId))
             {
@@ -64,6 +72,13 @@ public sealed class CodexCliRunner : ICodexRunner
 
             using var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             activeRun.AttachProcess(process);
+
+            logger.LogInformation(
+                "Starting codex process; chatId={ChatId}, threadId={ThreadId}, cwd={WorkingDirectory}, cmd={Command}",
+                request.ChatId,
+                request.MessageThreadId,
+                startInfo.WorkingDirectory,
+                BuildDisplayCommand(startInfo));
 
             if (!process.Start())
             {
@@ -83,6 +98,14 @@ public sealed class CodexCliRunner : ICodexRunner
 
             await foreach (var update in channel.Reader.ReadAllAsync(runCts.Token))
             {
+                if (request.StopOnCommandStart &&
+                    string.Equals(update.Kind, "command_start", StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(update.Chunk))
+                {
+                    await CancelAsync(request.ChatId, request.MessageThreadId, cancellationToken);
+                    throw new CodexApprovalRequiredException(update.Chunk.Trim());
+                }
+
                 yield return update;
             }
 
@@ -98,6 +121,12 @@ public sealed class CodexCliRunner : ICodexRunner
             {
                 throw BuildCodexRunException(process.ExitCode, stderrTail, "Codex exited with error.");
             }
+
+            logger.LogInformation(
+                "Codex completed successfully; chatId={ChatId}, threadId={ThreadId}, exitCode={ExitCode}",
+                request.ChatId,
+                request.MessageThreadId,
+                process.ExitCode);
 
             yield return new CodexRunUpdate("Completed", Kind: "status", IsFinal: true);
         }
@@ -149,7 +178,7 @@ public sealed class CodexCliRunner : ICodexRunner
         return fallbackSeconds;
     }
 
-    private static async Task PumpStdoutAsync(
+    private async Task PumpStdoutAsync(
         StreamReader reader,
         ChannelWriter<CodexRunUpdate> writer,
         CancellationToken cancellationToken)
@@ -162,14 +191,20 @@ public sealed class CodexCliRunner : ICodexRunner
                 break;
             }
 
+            if (ShouldLogJsonEvents())
+            {
+                logger.LogInformation("Codex stdout event: {JsonLine}", line);
+            }
+
             if (TryExtractDisplayUpdateFromJsonLine(line, out var update) && !string.IsNullOrWhiteSpace(update.Chunk))
             {
+                logger.LogInformation("Codex parsed update; kind={Kind}, size={Size}", update.Kind, update.Chunk.Length);
                 await writer.WriteAsync(update, cancellationToken);
             }
         }
     }
 
-    private static async Task PumpStderrAsync(
+    private async Task PumpStderrAsync(
         StreamReader reader,
         Queue<string> stderrTail,
         CancellationToken cancellationToken)
@@ -181,6 +216,8 @@ public sealed class CodexCliRunner : ICodexRunner
             {
                 continue;
             }
+
+            logger.LogWarning("Codex stderr: {Line}", line);
 
             lock (stderrTail)
             {
@@ -265,13 +302,7 @@ public sealed class CodexCliRunner : ICodexRunner
                 return false;
             }
 
-            if (!item.TryGetProperty("text", out var textElement) || textElement.ValueKind != JsonValueKind.String)
-            {
-                return false;
-            }
-
-            var value = textElement.GetString();
-            if (string.IsNullOrWhiteSpace(value))
+            if (!TryExtractItemText(item, out var value) || string.IsNullOrWhiteSpace(value))
             {
                 return false;
             }
@@ -300,6 +331,77 @@ public sealed class CodexCliRunner : ICodexRunner
         {
             writer.TryComplete(ex);
         }
+    }
+
+    private static bool TryExtractItemText(JsonElement item, out string text)
+    {
+        if (item.TryGetProperty("text", out var textElement) && textElement.ValueKind == JsonValueKind.String)
+        {
+            text = textElement.GetString() ?? string.Empty;
+            return !string.IsNullOrWhiteSpace(text);
+        }
+
+        if (item.TryGetProperty("content", out var contentElement) && contentElement.ValueKind == JsonValueKind.Array)
+        {
+            var sb = new StringBuilder();
+            foreach (var contentPart in contentElement.EnumerateArray())
+            {
+                if (!contentPart.TryGetProperty("text", out var partTextElement) || partTextElement.ValueKind != JsonValueKind.String)
+                {
+                    continue;
+                }
+
+                var partText = partTextElement.GetString();
+                if (string.IsNullOrWhiteSpace(partText))
+                {
+                    continue;
+                }
+
+                if (sb.Length > 0)
+                {
+                    sb.AppendLine().AppendLine();
+                }
+
+                sb.Append(partText.TrimEnd());
+            }
+
+            text = sb.ToString();
+            return !string.IsNullOrWhiteSpace(text);
+        }
+
+        text = string.Empty;
+        return false;
+    }
+
+    private static string BuildDisplayCommand(ProcessStartInfo startInfo)
+    {
+        var args = startInfo.ArgumentList.Select(EscapeArg);
+        return $"{startInfo.FileName} {string.Join(' ', args)}".TrimEnd();
+    }
+
+    private static string EscapeArg(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "\"\"";
+        }
+
+        return value.Contains(' ', StringComparison.Ordinal) || value.Contains('"', StringComparison.Ordinal)
+            ? $"\"{value.Replace("\"", "\\\"", StringComparison.Ordinal)}\""
+            : value;
+    }
+
+    private static bool ShouldLogJsonEvents()
+    {
+        var raw = Environment.GetEnvironmentVariable("CODEX_LOG_JSON_EVENTS");
+        return IsTrue(raw);
+    }
+
+    private static bool IsTrue(string? raw)
+    {
+        return string.Equals(raw, "1", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(raw, "yes", StringComparison.OrdinalIgnoreCase);
     }
 
     private static InvalidOperationException BuildCodexRunException(int exitCode, Queue<string> stderrTail, string message)
